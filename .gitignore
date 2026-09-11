@@ -1,0 +1,12 @@
+# 构建产物 / build artifacts
+*.exe
+*.ll
+*.o
+*.obj
+*.log
+
+# 系统与临时文件 / system & temp
+Thumbs.db
+.DS_Store
+*.tmp
+_tmp_*
