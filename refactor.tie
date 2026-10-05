@@ -116,7 +116,7 @@ func has_pos(rs: table<i64>, re: table<i64>, l0: i64, c0: i64) -> bool {
 // 递归收集引用：tag ∈ {VAR, CALL, METHOD_CALL, FIELD_ACCESS} 且
 // intern.lookup(s_names[node]) == name → 记录 (s_lines-1, s_cols-1, len(name))。
 // r* 为平行表：rs=0-based 行，re=0-based 列，rlens=名字长度。
-func collect_refs(node: i64, name: string, uri: string, rs: table<i64>, re: table<i64>, rlens: table<i64>) {
+func collect_refs(node: i64, name: string, uri: string, ref rs: table<i64>, ref re: table<i64>, ref rlens: table<i64>) {
     if node < 0 {
         return
     }

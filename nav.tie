@@ -322,7 +322,7 @@ pub func references(uri: string, txt: string, base_dir: string, line: i64, chara
 
 // 递归遍历 AST：tag ∈ {N_VAR, N_CALL, N_METHOD_CALL, N_FIELD_ACCESS} 且
 // 名字匹配的节点记为引用（N_METHOD_CALL/N_FIELD_ACCESS 只比 s_names）。
-func walk_refs(node: i64, name: string, uri: string, locs: table<string>, ruris: table<string>, rls: table<i64>, rcs: table<i64>) {
+func walk_refs(node: i64, name: string, uri: string, ref locs: table<string>, ref ruris: table<string>, ref rls: table<i64>, ref rcs: table<i64>) {
     if node < 0 {
         return
     }

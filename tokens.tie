@@ -228,7 +228,7 @@ func kw_span(txt: string, node: i64) -> (i64, i64) {
 // ==================== 令牌收集 ====================
 
 // 追加令牌：(0 基行, 0 基列, 长度, 类型)。
-func tok_push(tl: table<i64>, tc: table<i64>, tlens: table<i64>, tt: table<i64>,
+func tok_push(ref tl: table<i64>, ref tc: table<i64>, ref tlens: table<i64>, ref tt: table<i64>,
               line: i64, col: i64, l: i64, t: i64) {
     table_push(tl, line)
     table_push(tc, col)
@@ -237,7 +237,7 @@ func tok_push(tl: table<i64>, tc: table<i64>, tlens: table<i64>, tt: table<i64>,
 }
 
 // 名字令牌：节点名（s_names → intern.lookup），位置 = 节点位置。
-func emit_name(node: i64, tl: table<i64>, tc: table<i64>, tlens: table<i64>, tt: table<i64>, t: i64) {
+func emit_name(node: i64, ref tl: table<i64>, ref tc: table<i64>, ref tlens: table<i64>, ref tt: table<i64>, t: i64) {
     var nid = s_names[node]
     if nid < 0 {
         return
@@ -260,8 +260,8 @@ func emit_name(node: i64, tl: table<i64>, tc: table<i64>, tlens: table<i64>, tt:
 
 // 声明名令牌：关键字之后的名字（FN_DEF/STRUCT/ENUM）。
 // 位置 = kw_span 之后第一个标识符。
-func emit_after_kw(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
-                   tlens: table<i64>, tt: table<i64>, t: i64) {
+func emit_after_kw(node: i64, txt: string, ref tl: table<i64>, ref tc: table<i64>,
+                   ref tlens: table<i64>, ref tt: table<i64>, t: i64) {
     var nid = s_names[node]
     if nid < 0 {
         return
@@ -282,8 +282,8 @@ func emit_after_kw(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
 }
 
 // var/const 声明名令牌：关键字之后的名字。
-func emit_var_decl(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
-                   tlens: table<i64>, tt: table<i64>) {
+func emit_var_decl(node: i64, txt: string, ref tl: table<i64>, ref tc: table<i64>,
+                   ref tlens: table<i64>, ref tt: table<i64>) {
     var nid = s_names[node]
     if nid < 0 {
         return
@@ -313,8 +313,8 @@ func emit_var_decl(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
 }
 
 // 命名空间段名令牌：关键字之后逐段读标识符（namespace a.b { ... }）。
-func emit_ns(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
-             tlens: table<i64>, tt: table<i64>) {
+func emit_ns(node: i64, txt: string, ref tl: table<i64>, ref tc: table<i64>,
+             ref tlens: table<i64>, ref tt: table<i64>) {
     var (s, e) = kw_span(txt, node)
     if s < 0 {
         return
@@ -342,8 +342,8 @@ func emit_ns(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
 
 // 参数名令牌：参数节点位置在声明末尾（类型/默认值之后），名字在其前。
 // 从节点位置回溯（最多上溯 6 行）找最近一个与参数名相同的标识符。
-func emit_param(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
-                tlens: table<i64>, tt: table<i64>) {
+func emit_param(node: i64, txt: string, ref tl: table<i64>, ref tc: table<i64>,
+                ref tlens: table<i64>, ref tt: table<i64>) {
     var nid = s_names[node]
     if nid < 0 {
         return
@@ -392,8 +392,8 @@ func emit_param(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
 }
 
 // 方法名令牌：METHOD_CALL 节点位置在接收者起始，名字 = "."+方法名 前向扫描。
-func emit_method(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
-                 tlens: table<i64>, tt: table<i64>) {
+func emit_method(node: i64, txt: string, ref tl: table<i64>, ref tc: table<i64>,
+                 ref tlens: table<i64>, ref tt: table<i64>) {
     var nid = s_names[node]
     if nid < 0 {
         return
@@ -438,8 +438,8 @@ func emit_method(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
 
 // 关键字令牌：节点固定关键字（长度表）；FN_DEF/STRUCT/ENUM/NAMESPACE/EXTERN
 // 用 kw_span 取实际关键字位置与长度（兼容 pub/repr/unsafe 修饰前缀）。
-func emit_kw(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
-             tlens: table<i64>, tt: table<i64>) {
+func emit_kw(node: i64, txt: string, ref tl: table<i64>, ref tc: table<i64>,
+             ref tlens: table<i64>, ref tt: table<i64>) {
     var tag = s_tags[node]
     if tag == TOK_FN_DEF || tag == TOK_STRUCT || tag == TOK_ENUM ||
        tag == TOK_NAMESPACE || tag == TOK_EXTERN {
@@ -489,8 +489,8 @@ func emit_kw(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
 
 // 递归收集语义令牌。fnl/fnc：所在函数/外联声明起始位置（0 基；-1 = 顶层），
 // 用于跳过与声明同位的合成 "void" 返回类型节点。
-func walk_tokens(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
-                 tlens: table<i64>, tt: table<i64>, fnl: i64, fnc: i64) {
+func walk_tokens(node: i64, txt: string, ref tl: table<i64>, ref tc: table<i64>,
+                 ref tlens: table<i64>, ref tt: table<i64>, fnl: i64, fnc: i64) {
     if node < 0 {
         return
     }
@@ -563,7 +563,7 @@ func walk_tokens(node: i64, txt: string, tl: table<i64>, tc: table<i64>,
 }
 
 // 令牌按 (行, 列) 排序（插入排序，令牌数有限）。
-func sort_tokens(tl: table<i64>, tc: table<i64>, tlens: table<i64>, tt: table<i64>) {
+func sort_tokens(ref tl: table<i64>, ref tc: table<i64>, ref tlens: table<i64>, ref tt: table<i64>) {
     var n = len(tl)
     var i: i64 = 1
     while i < n {
@@ -679,7 +679,7 @@ func block_end_line(node: i64) -> i64 {
 }
 
 // 递归收集折叠区间（块型节点 + 跨多行 + 起止行差 >= 1）。
-func walk_fold(node: i64, sl: table<i64>, el: table<i64>) {
+func walk_fold(node: i64, ref sl: table<i64>, ref el: table<i64>) {
     if node < 0 {
         return
     }
@@ -710,7 +710,7 @@ func walk_fold(node: i64, sl: table<i64>, el: table<i64>) {
 }
 
 // 区间按 startLine 排序（插入排序，稳定）。
-func sort_ranges(sl: table<i64>, el: table<i64>) {
+func sort_ranges(ref sl: table<i64>, ref el: table<i64>) {
     var n = len(sl)
     var i: i64 = 1
     while i < n {
