@@ -73,6 +73,29 @@ var g_dep_list: table<string>
 var g_txt_uris: table<string>
 var g_txts: table<string>
 
+// ==================== p.9.16.2/.4 内存工程：配置 / 释放统计 / 常驻 LRU ====================
+// 配置一律走环境变量，**默认值保守**（lazy 开、其余 0=关）⇒ 无参启动行为逐字节不变。
+var g_cfg_lazy: i64 = -1          // TSP_LAZY：1(默认)=分析产出后立即释放前端 AST；0=保留（A/B 对照）
+var g_cfg_debounce: i64 = -1      // TSP_DEBOUNCE_MS：didChange 重析合并窗口（毫秒；0=关，默认）
+var g_cfg_maxdocs: i64 = -1       // TSP_MAX_OPEN_DOCS：常驻文档数上限（0=不限，默认）
+var g_cfg_budget: i64 = -1        // TSP_MEM_BUDGET：常驻内存预算（字节，软指标；0=不限，默认）
+var g_cfg_evicttext: i64 = -1     // TSP_EVICT_TEXT：LRU 回收是否含全文（0=默认否，见 evict_doc）
+// 释放统计（验收报告用；非功能路径）。
+var g_rel_gens: i64 = 0           // 已释放的「分析代」数
+var g_rel_nodes: i64 = 0          // 累计释放的 AST 节点数（= 释放前 s_n 求和，回收量指标）
+// 常驻生命周期（LRU）：uri → 最近访问时刻（clock 毫秒）。
+var g_lru_uris: table<string>
+var g_lru_when: table<i64>
+var g_evicted: i64 = 0            // 已回收文档数
+// didChange 防抖：uri → 上次变更时刻（clock 毫秒）。
+var g_chg_uris: table<string>
+var g_chg_when: table<i64>
+
+// 单调时钟（毫秒）。MSVC 的 clock() = 进程启动以来的墙钟 × CLOCKS_PER_SEC(=1000)
+// ⇒ 毫秒精度且**含等待输入的墙钟时间**（正是防抖/LRU 需要的语义；libc time() 只有秒）。
+// `clock` 已在编译器 is_libc_sym 白名单内（不引入 E00888），且 tsp 非编译器 ⇒ 无自举死锁。
+unsafe extern fn clock() -> i64;
+
 namespace tsp_an {
 
 // ==================== 文档文本存储（跨文件扫描） ====================
@@ -257,11 +280,19 @@ func an_substr(s: string, start: i64, end: i64) -> string {
 // 可重建）；ok=0 表示词法/语法/语义错误（诊断 = 单条编译器错误）。
 // 带文件级指纹缓存：文本未变返回缓存（诊断 + ok 均缓存）。
 // base_dir：文档所在目录（import 相对路径解析基准，尾随 '/'）。
-pub func analyze(uri: string, txt: string, base_dir: string) -> (string, i64) {
+//
+// ★ p.9.16.2：多返回一个 **fresh 标志**（1 = 本次真跑了完整前端管线 ⇒ sstate 有效，
+// 可安全调 index_doc；0 = 文本未变命中指纹缓存 ⇒ sstate 未被重建）。
+// 为什么必须区分（不是可选优化，是正确性）：
+//   · release_ast() 之后，缓存命中的那次仍调 index_doc 会读到**空的 g_file_roots**
+//     ⇒ 越界 panic（实测 `OOB an::index_doc [g_file_roots] line 413 idx 0 len 0`）；
+//   · 即便不释放，命中缓存却重建索引也会**静默用上一个文档的陈旧 sstate**建索引
+//     （各文档索引互相污染）——这是改造前就潜伏的缺陷，释放 AST 把它变成响的。
+pub func analyze_ex(uri: string, txt: string, base_dir: string) -> (string, i64, i64) {
     var fp = fingerprint(txt)
     var idx = diag_find(uri)
     if idx >= 0 && g_diag_fps[idx] == fp {
-        return (g_diag_json[idx], g_diag_ok[idx])
+        return (g_diag_json[idx], g_diag_ok[idx], 0)
     }
     // 剥离文件类型声明头部（type tie<X>），与真实管线同规则
     var src = strip_type_decl(txt)
@@ -269,7 +300,7 @@ pub func analyze(uri: string, txt: string, base_dir: string) -> (string, i64) {
     if prc < 0 {
         var r1 = err_to_diag(parser.ast_err_protocol())
         diag_set(uri, fp, r1, 0)
-        return (r1, 0)
+        return (r1, 0, 1)
     }
     var sem = semantic.check_ast(base_dir)
     var out: string = ""
@@ -281,7 +312,13 @@ pub func analyze(uri: string, txt: string, base_dir: string) -> (string, i64) {
         out = warns_to_diag(sem)
     }
     diag_set(uri, fp, out, ok)
-    return (out, ok)
+    return (out, ok, 1)
+}
+
+// 兼容入口（忽略 fresh）；需要「本次是否重建了 sstate」的调用方请用 analyze_ex。
+pub func analyze(uri: string, txt: string, base_dir: string) -> (string, i64) {
+    var (j, ok, fresh) = analyze_ex(uri, txt, base_dir)
+    return (j, ok)
 }
 
 // 便捷入口：仅返回诊断 JSON（忽略 ok）。
@@ -381,8 +418,14 @@ func add_sym(name: string, kind: string, sig: string, line: i64, col: i64) {
 }
 
 // 重建文档符号段：清旧段（重建扁平表）→ 遍历主文件顶层收集。
-// 前置：semantic.check_ast 成功（sstate 表有效，g_file_roots[0] = 主文件根）。
+// 前置：**本次** semantic.check_ast 成功（sstate 表有效，g_file_roots[0] = 主文件根）。
+// ★ p.9.16.2：命中指纹缓存（未重建 sstate）时**不得**调用本函数——那时 s_* 表要么是
+// 空的（release_ast 之后），要么属于别的文档（陈旧 sstate）。调用方用 analyze_ex 的
+// fresh 标志门控。另加空表守卫：g_file_roots 为空即直接返回（防御，不再越界 panic）。
 pub func index_doc(uri: string) -> i64 {
+    if len(g_file_roots) == 0 {
+        return 0
+    }
     var idx = idx_find(uri)
     remove_segment(idx)
     var start = len(g_inames)
@@ -503,6 +546,18 @@ func remove_segment(idx: i64) {
 
 // 记录文档的 import 依赖（g_imported 归一化路径）。
 // （g_dep_uris/g_dep_list 声明在文件顶层）
+
+// 依赖表按 uri 定位（-1 = 无）；set_deps/doc_imports/doc_bytes 共用。
+func dep_find(uri: string) -> i64 {
+    var i: i64 = 0
+    while i < len(g_dep_uris) {
+        if g_dep_uris[i] == uri {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
 
 func set_deps(uri: string) {
     var idx = -1
@@ -887,6 +942,334 @@ func an_trim(s: string) -> string {
         }
     }
     return an_substr(s, a, b)
+}
+
+// ==================== p.9.16 内存工程 ====================
+// 三线：① 按需 lazy + AST 释放（release_now）② 状态去冗余（server 侧重复符号索引
+// 已删除，hover/大纲复用本文的 g_i* 唯一真相）③ 常驻生命周期 LRU（touch/evict_*）。
+// 全部默认保守：TSP_LAZY 默认开（只影响「用完即释放」），其余默认 0=关 ⇒ 无参启动
+// 行为不变（与改造前逐字节一致）。
+
+// ---- ① 配置（环境变量；惰性求值一次并缓存）----
+func cfg_num(name: string, dflt: i64) -> i64 {
+    var v = get_env(name)
+    if len(v) == 0 {
+        return dflt
+    }
+    return an_parse_num(v)
+}
+
+pub func lazy_on() -> i64 {
+    if g_cfg_lazy < 0 {
+        g_cfg_lazy = cfg_num("TSP_LAZY", 1)
+    }
+    return g_cfg_lazy
+}
+
+pub func debounce_ms() -> i64 {
+    if g_cfg_debounce < 0 {
+        g_cfg_debounce = cfg_num("TSP_DEBOUNCE_MS", 0)
+    }
+    return g_cfg_debounce
+}
+
+pub func max_open_docs() -> i64 {
+    if g_cfg_maxdocs < 0 {
+        g_cfg_maxdocs = cfg_num("TSP_MAX_OPEN_DOCS", 0)
+    }
+    return g_cfg_maxdocs
+}
+
+pub func mem_budget() -> i64 {
+    if g_cfg_budget < 0 {
+        g_cfg_budget = cfg_num("TSP_MEM_BUDGET", 0)
+    }
+    return g_cfg_budget
+}
+
+pub func evict_text_on() -> i64 {
+    if g_cfg_evicttext < 0 {
+        g_cfg_evicttext = cfg_num("TSP_EVICT_TEXT", 0)
+    }
+    return g_cfg_evicttext
+}
+
+// ---- ② 用后释放前端 AST（p.9.16.2）----
+// 在「本代分析所需结果已全部抽出」（诊断 JSON / 符号索引 / 依赖图都已落到本文的
+// 平面表）之后调用：把前端静态表 s_* 列式 AST + intern 池 + parser 节点池一并
+// 回退到空始态 ⇒ 常驻不再随文档数线性增长（峰值只存在于单次分析期间）。
+// TSP_LAZY=0 时不释放（保留 AST，供 A/B 对照与调试）。
+// ⚠ 释放后**不得**再读 s_* / g_file_roots / intern：本文的 index_doc/collect_tops
+//   必须在释放前完成（当前调用点均在 index_doc 之后）。
+pub func release_now() {
+    if lazy_on() == 0 {
+        return
+    }
+    g_rel_gens = g_rel_gens + 1
+    g_rel_nodes = g_rel_nodes + s_n
+    semantic.release_ast()
+}
+
+pub func release_gens() -> i64 {
+    return g_rel_gens
+}
+
+pub func release_nodes() -> i64 {
+    return g_rel_nodes
+}
+
+// ---- ③ 常驻生命周期：LRU 记账 ----
+func lru_now() -> i64 {
+    var t: i64 = 0
+    unsafe {
+        t = clock()
+    }
+    return t
+}
+
+func lru_find(uri: string) -> i64 {
+    var i: i64 = 0
+    while i < len(g_lru_uris) {
+        if g_lru_uris[i] == uri {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 记录一次访问（didOpen/didChange/任意请求命中该文档）。
+pub func touch(uri: string) {
+    if len(uri) == 0 {
+        return
+    }
+    var t = lru_now()
+    var i = lru_find(uri)
+    if i >= 0 {
+        g_lru_when[i] = t
+    } else {
+        table_push(g_lru_uris, uri)
+        table_push(g_lru_when, t)
+    }
+}
+
+func lru_forget(uri: string) {
+    var i = lru_find(uri)
+    if i < 0 {
+        return
+    }
+    var nu = table_new_string()
+    var nw = table_new_i64()
+    var j: i64 = 0
+    while j < len(g_lru_uris) {
+        if j != i {
+            table_push(nu, g_lru_uris[j])
+            table_push(nw, g_lru_when[j])
+        }
+        j = j + 1
+    }
+    g_lru_uris = nu
+    g_lru_when = nw
+}
+
+func lru_time_of(uri: string) -> i64 {
+    var i = lru_find(uri)
+    if i < 0 {
+        return 0
+    }
+    return g_lru_when[i]
+}
+
+func in_str_list(t: table<string>, v: string) -> bool {
+    var i: i64 = 0
+    while i < len(t) {
+        if t[i] == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 单文档近似驻留字节（文本 + 诊断缓存 + 依赖清单）。用途是 LRU 的**软指标**
+// （排序与阈值判定），不是精确分配量。
+func doc_bytes(uri: string) -> i64 {
+    var b: i64 = 0
+    var ti = txt_find(uri)
+    if ti >= 0 {
+        b = b + len(g_txts[ti])
+    }
+    var di = diag_find(uri)
+    if di >= 0 {
+        b = b + len(g_diag_json[di]) + len(g_diag_fps[di])
+    }
+    var pi = dep_find(uri)
+    if pi >= 0 {
+        b = b + len(g_dep_list[pi])
+    }
+    return b
+}
+
+pub func resident_docs() -> i64 {
+    return len(g_txt_uris)
+}
+
+pub func resident_bytes() -> i64 {
+    var b: i64 = 0
+    var i: i64 = 0
+    while i < len(g_txt_uris) {
+        b = b + doc_bytes(g_txt_uris[i])
+        i = i + 1
+    }
+    return b
+}
+
+pub func evicted_count() -> i64 {
+    return g_evicted
+}
+
+// p.9.16.5 验收自述：内存工程的可观测度量（供 `tsp/stats` 自定义方法直接回给探针/报告）。
+// 存在的理由：内存本身难断言（分配器保留使 WS 变化被掩盖），而「常驻文档数 / 已回收数 /
+// 已释放代数」是**确定性**的 ⇒ 用它证明旋钮真的被读取并生效（名字兑现承诺）。
+pub func stats_json() -> string {
+    return "{\"residentDocs\":" + to_string(resident_docs()) +
+           ",\"residentBytes\":" + to_string(resident_bytes()) +
+           ",\"releasedGens\":" + to_string(g_rel_gens) +
+           ",\"releasedNodes\":" + to_string(g_rel_nodes) +
+           ",\"evicted\":" + to_string(g_evicted) +
+           ",\"lazy\":" + to_string(lazy_on()) +
+           ",\"debounceMs\":" + to_string(debounce_ms()) +
+           ",\"maxOpenDocs\":" + to_string(max_open_docs()) +
+           ",\"memBudget\":" + to_string(mem_budget()) +
+           ",\"evictText\":" + to_string(evict_text_on()) + "}"
+}
+
+// 回收单文档的常驻分析状态（LRU 淘汰动作）。
+// 层级（设计 §4.4「回收粒度可配」的落地）：
+//   · 默认（TSP_EVICT_TEXT=0）：只丢**可重算**的派生态——符号索引 + 依赖图 + 诊断缓存；
+//     全文保留（编辑器的未保存缓冲不可丢：丢了就无法重算，而 LSP 没有其它来源）。
+//   · TSP_EVICT_TEXT=1：连同全文一并丢；下次访问由 ensure_text 从磁盘冷重建
+//     （⚠ 对未保存的缓冲是**有损**的，故默认关）。
+func evict_doc(uri: string) {
+    drop_doc(uri)
+    if evict_text_on() == 1 {
+        drop_text(uri)
+    }
+    lru_forget(uri)
+    g_evicted = g_evicted + 1
+}
+
+// 超限即按 LRU 回收（最久未访问者优先），直到回到限内或无可回收者。
+// 两个开关都为 0（默认）时**立即返回** ⇒ 零额外开销、行为不变。
+pub func evict_if_needed() {
+    var md = max_open_docs()
+    var mb = mem_budget()
+    if md == 0 && mb == 0 {
+        return
+    }
+    var done = table_new_string()
+    var guard: i64 = 0
+    var n0 = len(g_txt_uris)
+    while guard <= n0 {
+        var n = len(g_txt_uris)
+        var over_docs = false
+        if md > 0 && n > md {
+            over_docs = true
+        }
+        var over_mem = false
+        if mb > 0 && resident_bytes() > mb {
+            over_mem = true
+        }
+        if !over_docs && !over_mem {
+            return
+        }
+        // 选「最久未访问且尚未回收」的文档
+        var victim: string = ""
+        var best: i64 = -1
+        var i: i64 = 0
+        while i < n {
+            var u = g_txt_uris[i]
+            if !in_str_list(done, u) {
+                var w = lru_time_of(u)
+                if best < 0 || w < best {
+                    best = w
+                    victim = u
+                }
+            }
+            i = i + 1
+        }
+        if len(victim) == 0 {
+            return
+        }
+        evict_doc(victim)
+        table_push(done, victim)
+        guard = guard + 1
+    }
+}
+
+// uri → 本地文件路径（file:// 前缀与前导斜杠剥离；非 file uri 返回空串）。
+pub func uri_fs_path(uri: string) -> string {
+    var p = uri
+    if an_has_prefix(p, "file://") {
+        p = an_substr(p, 7, len(p))
+    }
+    while len(p) > 0 && (str_byte(p, 0) == 47 || str_byte(p, 0) == 92) {
+        p = an_substr(p, 1, len(p))
+    }
+    return p
+}
+
+// 取文档文本：常驻在则直回；已被 LRU 回收（TSP_EVICT_TEXT=1）则**冷重建**——
+// 从磁盘读回并重新驻留。冷重建是「丢全文」这一档的必要配套（设计 §4.4）。
+pub func ensure_text(uri: string) -> string {
+    var t = fetch_text(uri)
+    if len(t) > 0 {
+        return t
+    }
+    var p = uri_fs_path(uri)
+    if len(p) == 0 {
+        return ""
+    }
+    if !file_exists(p) {
+        return ""
+    }
+    var s = file_read(p)
+    if len(s) > 0 {
+        store_text(uri, s)
+        touch(uri)
+    }
+    return s
+}
+
+// ---- didChange 防抖（p.9.16.2）----
+// 该文档上次变更是否落在防抖窗口内（窗口内 ⇒ 本此变更**合并**、暂不重析）。
+pub func changed_recently(uri: string) -> bool {
+    var win = debounce_ms()
+    if win <= 0 {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(g_chg_uris) {
+        if g_chg_uris[i] == uri {
+            return (lru_now() - g_chg_when[i]) < win
+        }
+        i = i + 1
+    }
+    return false
+}
+
+pub func mark_change(uri: string) {
+    var t = lru_now()
+    var i: i64 = 0
+    while i < len(g_chg_uris) {
+        if g_chg_uris[i] == uri {
+            g_chg_when[i] = t
+            return
+        }
+        i = i + 1
+    }
+    table_push(g_chg_uris, uri)
+    table_push(g_chg_when, t)
 }
 
 }   // namespace tsp_an

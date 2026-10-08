@@ -16,10 +16,15 @@ type tie<logic>
 // 或直接由 vscode 扩展配置绝对路径。
 //
 // 增量分析：文件级指纹缓存（诊断 + ok 状态），didChange 全量重算单文件；
+// p.9.16 内存工程（tsp 侧）：① 每条消息处理完立即释放前端 AST（TSP_LAZY，默认开）
+// ② 去冗余——server 侧重复符号索引已删，hover/大纲复用 analyze 的 g_i* 唯一真相
+// ③ 常驻 LRU——TSP_MAX_OPEN_DOCS / TSP_MEM_BUDGET 超限按最久未访问回收，
+//    TSP_EVICT_TEXT 控制是否连全文一起丢（默认否），见 analyze.tie evict_doc；
+// ④ didChange 防抖 TSP_DEBOUNCE_MS（默认 0=关）。
 // 单文件错误隔离：坏文档只产生自身诊断，不崩服务。
 // ============================================================================
 
-import "../../std/stdio.tie" as stdio
+import "/std/stdio.tie" as stdio
 import "./protocol.tie" as proto
 import "./analyze.tie" as an
 import "./completion.tie" as tsp_comp
@@ -35,6 +40,10 @@ using tsp_proto;
 // 打开的文档：文本存储在 analyze（tsp_an.store_text/fetch_text/drop_text），
 // 跨文件引用/重命名扫描可直接枚举全部打开文档（an.doc_count/doc_uri + fetch_text）。
 var g_seq: i64 = 0          // notification/request 计数（诊断用 server 版本）
+// p.9.16.2 防抖：被合并（暂缓重析）的文档 uri 队列。窗口内连续 didChange 只记
+// 文本、不重析；收到下一条**非 didChange** 消息时统一冲刷。默认窗口 0=关 ⇒ 队列
+// 恒空、行为与改造前一致。
+var g_dirty: table<string>
 
 // ---- 文档文本存取（委托 analyze 文本存储）----
 
@@ -42,8 +51,11 @@ func set_doc(uri: string, txt: string) {
     an.store_text(uri, txt)
 }
 
+// p.9.16.2/.4：取文档文本，并**记录一次访问**（LRU 记账的唯一入口——几乎所有
+// 请求分支都经此取文本）。文本若已被 LRU 回收（TSP_EVICT_TEXT=1）则冷重建。
 func get_doc(uri: string) -> string {
-    return an.fetch_text(uri)
+    an.touch(uri)
+    return an.ensure_text(uri)
 }
 
 func remove_doc(uri: string) {
@@ -274,11 +286,10 @@ func cascade_imports(x_uri: string) {
         if du != x_uri && an.doc_imports(du, x_path) {
             var dtext = an.fetch_text(du)
             if len(dtext) > 0 {
-                var (diags, dok) = an.analyze(du, dtext, uri_to_dir(du))
-                if dok == 1 {
+                var (diags, dok, dfresh) = an.analyze_ex(du, dtext, uri_to_dir(du))
+                if dok == 1 && dfresh == 1 {
                     an.index_doc(du)
                 }
-                rebuild_syms(du, dtext)
                 publish_diagnostics(du, diags)
             }
         }
@@ -387,122 +398,11 @@ func publish_diagnostics(uri: string, diagnostics: string) {
 }
 
 // ---- 符号签名索引（hover 用）----
-// 每个打开的文档维护：符号名表 + 签名表（平行）。didOpen/didChange 时重建。
-var g_sym_uris: table<string>   // 并行 uri
-var g_sym_names: table<string>  // 每文档：名称表（分号分隔，首版简化）
-var g_sym_sigs: table<string>   // 每文档：签名表（平行分号分隔）
-
-func rebuild_syms(uri: string, txt: string) {
-    var idx = -1
-    var i: i64 = 0
-    while i < len(g_sym_uris) {
-        if g_sym_uris[i] == uri {
-            idx = i
-            break
-        }
-        i = i + 1
-    }
-    // string_builder 线性组装（`+` 累积对千级函数行是 O(n²)）
-    var sb_names = string_builder()
-    var sb_sigs = string_builder()
-    var first: bool = true
-    // 逐行收集 func/pub func 签名
-    var pos: i64 = 0
-    while pos < len(txt) {
-        var le = pos
-        while le < len(txt) && str_byte(txt, le) != 10 {
-            le = le + 1
-        }
-        var line_t = proto.substr_at(txt, pos, le)
-        var lt = trim_str(line_t)
-        var check = lt
-        if str_find(check, "pub func ") == 0 {
-            check = proto.substr_at(check, len("pub func "), len(check))
-            var nm = id_after(check, 0)
-            if len(nm) > 0 {
-                if !first {
-                    sb_append(sb_names, ";")
-                    sb_append(sb_sigs, ";")
-                }
-                first = false
-                sb_append(sb_names, nm)
-                sb_append(sb_sigs, line_t)
-            }
-        } else if str_find(check, "func ") == 0 {
-            check = proto.substr_at(check, len("func "), len(check))
-            var nm2 = id_after(check, 0)
-            if len(nm2) > 0 && str_find(nm2, "main") != 0 {
-                if !first {
-                    sb_append(sb_names, ";")
-                    sb_append(sb_sigs, ";")
-                }
-                first = false
-                sb_append(sb_names, nm2)
-                sb_append(sb_sigs, line_t)
-            }
-        }
-        pos = le + 1
-    }
-    var names = sb_build(sb_names)
-    var sigs = sb_build(sb_sigs)
-    if idx >= 0 {
-        g_sym_names[idx] = names
-        g_sym_sigs[idx] = sigs
-    } else {
-        table_push(g_sym_uris, uri)
-        table_push(g_sym_names, names)
-        table_push(g_sym_sigs, sigs)
-    }
-}
-
-// 查询某文档中 name 的签名（未找到返回空串）。
-func find_sig(uri: string, name: string) -> string {
-    var idx = -1
-    var i: i64 = 0
-    while i < len(g_sym_uris) {
-        if g_sym_uris[i] == uri {
-            idx = i
-            break
-        }
-        i = i + 1
-    }
-    if idx < 0 {
-        return ""
-    }
-    var names = g_sym_names[idx]
-    var sigs = g_sym_sigs[idx]
-    // 解析分号分隔
-    var nparts = split_semi(names)
-    var sparts = split_semi(sigs)
-    var k: i64 = 0
-    while k < len(nparts) {
-        if nparts[k] == name && k < len(sparts) {
-            return sparts[k]
-        }
-        k = k + 1
-    }
-    return ""
-}
-
-// 按分号切分（空串 → 空表）。
-func split_semi(s: string) -> table<string> {
-    var out = table_new_string()
-    var cur: string = ""
-    var i: i64 = 0
-    while i < len(s) {
-        var c = str_char(s, i)
-        if c == ";" {
-            table_push(out, cur)
-            cur = ""
-        } else {
-            cur = cur + c
-        }
-        i = i + 1
-    }
-    table_push(out, cur)
-    return out
-}
-
+// ★ p.9.16.3 状态去冗余：**本段已删除**。原实现（g_sym_uris / g_sym_names /
+// g_sym_sigs + rebuild_syms / find_sig / split_semi）在 server 侧**重复建了一份**
+// 「符号名 → 签名」索引——而 analyze 的符号索引（g_i*，index_doc 产出）本就是
+// 同一域的唯一真相。hover 现已只走 `an.find_sym_named` + `an.sym_sig`（见
+// hover_result），少一份全文行扫描 + 每文档一条签名串副本。
 // 某位置处的标识符（向前/向后扩展字母数字_；字节级）。
 func ident_at(txt: string, off: i64) -> string {
     if off < 0 || off > len(txt) {
@@ -522,7 +422,9 @@ func ident_at(txt: string, off: i64) -> string {
     return proto.substr_at(txt, a, b)
 }
 
-// Hover 响应：优先索引签名（AST 重建，多行签名可靠），回退行扫描签名。
+// Hover 响应：查符号索引（index_doc 由 AST 重建 ⇒ 多行签名可靠）。
+// ★ p.9.16.3：**已去除** server 侧行扫描签名回退（那是重复索引的第二份实现）；
+//   索引未命中即返回 null（未索引的文档本就没有可靠签名可给）。
 func hover_result(uri: string, txt: string, line: i64, character: i64) -> string {
     var off = pos_to_offset(txt, line, character)
     var nm = ident_at(txt, off)
@@ -534,14 +436,59 @@ func hover_result(uri: string, txt: string, line: i64, character: i64) -> string
     if si >= 0 {
         sig = an.sym_sig(uri, si)
     }
-    if len(sig) == 0 {
-        sig = find_sig(uri, nm)
-    }
     if len(sig) > 0 {
         var contents = "[{\"language\":\"tie\",\"value\":" + proto.json_str(sig) + "}]"
         return "{\"contents\":" + contents + "}"
     }
     return "null"
+}
+
+// ---- p.9.16.2 防抖：脏文档队列 ----
+
+func dirty_has(uri: string) -> bool {
+    var i: i64 = 0
+    while i < len(g_dirty) {
+        if g_dirty[i] == uri {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+func dirty_remove(uri: string) {
+    var n = table_new_string()
+    var i: i64 = 0
+    while i < len(g_dirty) {
+        if g_dirty[i] != uri {
+            table_push(n, g_dirty[i])
+        }
+        i = i + 1
+    }
+    g_dirty = n
+}
+
+// 冲刷被合并的文档：重析 + 重建索引 + 推送诊断（与 didChange 直通路径等价）。
+func flush_dirty() {
+    if len(g_dirty) == 0 {
+        return
+    }
+    var pending = g_dirty
+    g_dirty = table_new_string()
+    var i: i64 = 0
+    while i < len(pending) {
+        var u = pending[i]
+        var txt = an.ensure_text(u)
+        if len(txt) > 0 {
+            var (d, ok, fresh) = an.analyze_ex(u, txt, uri_to_dir(u))
+            if ok == 1 && fresh == 1 {
+                an.index_doc(u)
+            }
+            publish_diagnostics(u, d)
+            cascade_imports(u)
+        }
+        i = i + 1
+    }
 }
 
 // ---- 主循环 ----
@@ -558,6 +505,10 @@ func main() -> i64 {
         }
         // 提取 method / id
         var method = json_field(body, "method")
+        // p.9.16.2：非 didChange 消息到达 ⇒ 先冲刷防抖队列（保证后续请求看到最新分析与索引）。
+        if method != "textDocument/didChange" {
+            flush_dirty()
+        }
         var id = json_field(body, "id")
         var has_id = false
         if str_find(body, "\"id\"") >= 0 {
@@ -591,33 +542,46 @@ func main() -> i64 {
             if len(uri) > 0 {
                 set_doc(uri, txt)
                 var base = uri_to_dir(uri)
-                var (diags, ok) = an.analyze(uri, txt, base)
-                if ok == 1 {
+                var (diags, ok, fresh) = an.analyze_ex(uri, txt, base)
+                if ok == 1 && fresh == 1 {
                     an.index_doc(uri)
                 }
-                rebuild_syms(uri, txt)
+                an.touch(uri)
                 publish_diagnostics(uri, diags)
+                // p.9.16.4：超限即按 LRU 回收（两个开关默认 0=关 ⇒ 空操作）。
+                an.evict_if_needed()
             }
         } else if method == "textDocument/didChange" {
             var uri = json_field(body, "uri")
             var txt = json_field(body, "text")
             if len(uri) > 0 {
                 set_doc(uri, txt)
-                var base2 = uri_to_dir(uri)
-                var (diags2, ok2) = an.analyze(uri, txt, base2)
-                if ok2 == 1 {
-                    an.index_doc(uri)
+                an.touch(uri)
+                // p.9.16.2 防抖：窗口内的连续变更**合并**为一次重析（默认窗口 0=关，
+                // 即逐条重析 = 改造前行为）。文本已存，故窗口内只是诊断晚推 ≤ 窗口。
+                if an.changed_recently(uri) {
+                    if !dirty_has(uri) {
+                        table_push(g_dirty, uri)
+                    }
+                    an.mark_change(uri)
+                } else {
+                    var base2 = uri_to_dir(uri)
+                    var (diags2, ok2, fresh2) = an.analyze_ex(uri, txt, base2)
+                    if ok2 == 1 && fresh2 == 1 {
+                        an.index_doc(uri)
+                    }
+                    publish_diagnostics(uri, diags2)
+                    an.mark_change(uri)
+                    // import 变更级联：依赖本文件的其它打开文档重分析
+                    cascade_imports(uri)
                 }
-                rebuild_syms(uri, txt)
-                publish_diagnostics(uri, diags2)
-                // import 变更级联：依赖本文件的其它打开文档重分析
-                cascade_imports(uri)
             }
         } else if method == "textDocument/didClose" {
             var uri = json_field(body, "uri")
             if len(uri) > 0 {
                 remove_doc(uri)
                 an.drop_doc(uri)
+                dirty_remove(uri)
                 publish_diagnostics(uri, "[]")
             }
         }
@@ -688,6 +652,7 @@ func main() -> i64 {
         // 文档符号大纲（p.6.9.8）
         else if method == "textDocument/documentSymbol" {
             var uri = json_field(body, "uri")
+            an.touch(uri)
             var dsr = tsp_sig.doc_symbols(uri)
             proto.write_frame(make_response(resp_id, dsr))
         }
@@ -748,11 +713,22 @@ func main() -> i64 {
             proto.write_frame(make_response(resp_id, fr2))
         }
 
+        // p.9.16.5 内存工程自述（**自定义**方法，非 LSP 标准；供验收探针/报告读取）。
+        // 返回常驻文档数/近似字节、已释放代数与节点数、已回收文档数、四个旋钮的生效值。
+        else if method == "tsp/stats" {
+            proto.write_frame(make_response(resp_id, an.stats_json()))
+        }
+
         // 通用空响应（未实现方法返回 null，客户端无副作用）
         else if has_id {
             proto.write_frame(make_response(resp_id, "null"))
         }
         // notification 无 id 且不认识 → 忽略
+
+        // p.9.16.2 内存工程：本条消息所需结果已全部抽出（诊断已推送 / 索引已更新 /
+        // 依赖图已记），立即释放本代前端 AST（TSP_LAZY=0 时保留，供 A/B 对照）。
+        // 放在循环末**一处**即可覆盖全部方法（含所有请求分支）。
+        an.release_now()
     }
     return 0
 }

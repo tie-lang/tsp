@@ -16,7 +16,7 @@ type tie<class>
 // 本层只做传输与编解码，不涉业务。业务在 server.tie / analyze.tie。
 // ============================================================================
 
-import "../../std/stdio.tie" as stdio
+import "/std/stdio.tie" as stdio
 
 namespace tsp_proto {
 
