@@ -10,3 +10,9 @@ Thumbs.db
 .DS_Store
 *.tmp
 _tmp_*
+
+# 探针与冒烟脚本（本地工作材料，不入库）
+probe_*.tie
+lsp_smoke*.py
+lsp_knobs.py
+*.exe
