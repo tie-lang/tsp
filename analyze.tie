@@ -428,11 +428,18 @@ func add_sym(name: string, kind: string, sig: string, line: i64, col: i64) {
     table_push(g_icols, col)
 }
 
-// 重建文档符号段：清旧段（重建扁平表）→ 遍历主文件顶层收集。
+// 重建文档符号段：清旧段（重建扁平表）→ 收集主文件顶层声明。
 // 前置：**本次** semantic.check_ast 成功（sstate 表有效，g_file_roots[0] = 主文件根）。
 // ★ p.9.16.2：命中指纹缓存（未重建 sstate）时**不得**调用本函数——那时 s_* 表要么是
 // 空的（release_ast 之后），要么属于别的文档（陈旧 sstate）。调用方用 analyze_ex 的
 // fresh 标志门控。另加空表守卫：g_file_roots 为空即直接返回（防御，不再越界 panic）。
+//
+// ★ 符号来源（2026-10-12 升级）：**结构化记录优先，AST 浅扫描回退**——
+//   · 记录路径：symtab 的 xref 声明段（name/kind/scope/node/line/col 齐备）直装；
+//     该段非空 ⇔ tiec 服务模式已开 xref 采集（当前未开，serve-xref 待办落地后自动生效）；
+//   · 回退路径：xref 段为空（旧版 tiec / 未开采集）→ 原 AST 顶层浅扫描（collect_tops）。
+//   两条路径产出同形索引（名称「::」→「.」、含命名空间行、方法与别名不入索引；
+//   记录路径的任务顺序按行位合并，与浅扫描的文档序一致）。
 pub func index_doc(uri: string) -> i64 {
     if len(g_file_roots) == 0 {
         return 0
@@ -440,8 +447,12 @@ pub func index_doc(uri: string) -> i64 {
     var idx = idx_find(uri)
     remove_segment(idx)
     var start = len(g_inames)
-    // 收集主文件顶层声明
-    collect_tops(g_file_roots[0], "")
+    // 收集主文件顶层声明（记录优先；缺 xref 段时回退浅扫描）
+    if len(xref_decl_names) > 0 {
+        index_from_records()
+    } else {
+        collect_tops(g_file_roots[0], "")
+    }
     var cnt = len(g_inames) - start
     if idx >= 0 {
         g_ioff[idx] = start
@@ -669,6 +680,162 @@ func collect_tops(root: i64, prefix: string) {
             }
         }
         k = k + 1
+    }
+}
+
+// ==================== 符号索引：结构化记录直装（2026-10-12） ====================
+// xref 声明段（记录 188-198）→ 索引行：注册序 = 主文件内源序；名称「::」→「.」
+// （与调用语法一致）；过滤 = 主文件（node 的 file_id == 0）+ 顶层（scope == 0，
+// 含命名空间成员）。方法与别名不入索引（对等浅扫描的既有行为）。
+// ⚠ tiec 侧前置：服务模式需开 xref 采集（serve-xref 待办）；未开时段为空 ⇒ 回退。
+
+// 名字是否含「:」（方法节点名为 "Struct::method" 形态，不进索引）。
+func has_colon(s: string) -> bool {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == ":" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 名字是否含「$」——编译器合成名（如 actor 脱糖的 "actor$0.val"）不进索引；
+// '$' 不可能出现在用户标识符中（词法约定：字母/下划线/Unicode 字母起头）。
+func has_dollar(s: string) -> bool {
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        if str_char(s, i) == "$" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 记录名 → 索引名（"util::helper" → "util.helper"）。
+func dotify(s: string) -> string {
+    var sb = string_builder()
+    var n = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c = str_char(s, i)
+        if c == ":" && i + 1 < n && str_char(s, i + 1) == ":" {
+            sb_append(sb, ".")
+            i = i + 2
+        } else {
+            sb_append(sb, c)
+            i = i + 1
+        }
+    }
+    return sb_build(sb)
+}
+
+// 命名空间行收集（记录不含 ns 声明——唯一仍取 AST 的符号类：仅沿命名空间体
+// 递归，不触及其余声明；与浅扫描同形）。
+func collect_ns_rows(root: i64, prefix: string, ref nn: table<string>, ref nl: table<i64>, ref nc: table<i64>) {
+    if root < 0 {
+        return
+    }
+    var cn = s_nchild[root]
+    var base = s_coff[root]
+    var k: i64 = 0
+    while k < cn {
+        var c = s_children[base + k]
+        if c >= 0 && s_tags[c] == AN_NAMESPACE {
+            var nsegs = s_aux[c]
+            var segbase = s_coff[c]
+            var full = prefix
+            var si: i64 = 0
+            while si < nsegs {
+                var seg = s_children[segbase + si]
+                if seg >= 0 {
+                    full = full + intern.lookup(s_names[seg]) + "."
+                }
+                si = si + 1
+            }
+            table_push(nn, full)
+            table_push(nl, s_lines[c])
+            table_push(nc, s_cols[c])
+            if nsegs < s_nchild[c] {
+                var body = s_children[segbase + nsegs]
+                if body >= 0 && s_tags[body] == AN_STMTLIST {
+                    collect_ns_rows(body, full, nn, nl, nc)
+                }
+            }
+        }
+        k = k + 1
+    }
+}
+
+// 记录直装主流程：声明行（xref 序）与命名空间行（文档序）按行位合并发射。
+func index_from_records() {
+    var nn: table<string> = table_new_string()
+    var nl: table<i64> = table_new_i64()
+    var nc: table<i64> = table_new_i64()
+    collect_ns_rows(g_file_roots[0], "", nn, nl, nc)
+    var n = len(xref_decl_names)
+    var nsi: i64 = 0
+    var i: i64 = 0
+    while i < n {
+        var kind: string = ""
+        var sig: string = ""
+        var k = xref_decl_kinds[i]
+        var node = xref_decl_nodes[i]
+        if k == 0 {
+            // 函数：节点 tag 区分 fn/extern；方法（节点名含「::」）不进索引。
+            if node >= 0 && node < len(s_tags) {
+                if s_tags[node] == AN_FN_DEF {
+                    if !has_colon(intern.lookup(s_names[node])) {
+                        kind = "func"
+                        sig = fn_sig(node)
+                    }
+                } else if s_tags[node] == AN_EXTERN {
+                    kind = "extern"
+                }
+            }
+        } else if k == 1 {
+            kind = "struct"
+        } else if k == 2 {
+            kind = "enum"
+        } else if k == 4 {
+            kind = "global"
+        }
+        // 过滤：主文件（file 0）+ 顶层/命名空间成员（scope 0）+ 非合成名；节点须有效。
+        if str_len(kind) > 0 {
+            if node < 0 || node >= len(s_file_ids) || s_file_ids[node] != 0 {
+                kind = ""
+            } else if i >= len(xref_decl_scopes) || xref_decl_scopes[i] != 0 {
+                kind = ""
+            } else if has_dollar(xref_decl_names[i]) {
+                kind = ""
+            }
+        }
+        if str_len(kind) > 0 {
+            var ln: i64 = 0
+            var cl: i64 = 0
+            if i < len(xref_decl_lines) {
+                ln = xref_decl_lines[i]
+            }
+            if i < len(xref_decl_cols) {
+                cl = xref_decl_cols[i]
+            }
+            // 行序保序：先发射行位不晚于本声明行的命名空间行。
+            while nsi < len(nn) && nl[nsi] <= ln {
+                add_sym(nn[nsi], "namespace", "", nl[nsi], nc[nsi])
+                nsi = nsi + 1
+            }
+            add_sym(dotify(xref_decl_names[i]), kind, sig, ln, cl)
+        }
+        i = i + 1
+    }
+    // 收尾：剩余命名空间行（无后续声明行时）。
+    while nsi < len(nn) {
+        add_sym(nn[nsi], "namespace", "", nl[nsi], nc[nsi])
+        nsi = nsi + 1
     }
 }
 
