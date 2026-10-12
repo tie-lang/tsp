@@ -1,0 +1,41 @@
+type tie<tsh>
+// build.tsh.tie —— tsp 构建脚本（tsh 角色；官方构建入口）
+// ============================================================================
+// 用法（本仓根目录）：
+//   <tsh> -f build.tsh.tie [tiec 路径] [tlib 路径]
+// 默认相对布局（可用参数或环境变量覆盖，脚本内**无绝对路径**）：
+//   tiec：../tiec/compiler/tiec.exe（与 tiec 仓并列于同一上层目录）
+//   tlib：../../tlib（TIE_LIB_ROOT 环境变量优先于默认）
+// 产物：本仓根 tsp.exe
+// 退出码：0 成功 / 非 0 失败（透传编译器退出码）。
+
+println("=== tsp 构建（tie <tsh>；lib-root 解析库） ===")
+
+var root = cwd()
+if !has_suffix(root, "\\") && !has_suffix(root, "/") {
+    root = root + "\\"
+}
+
+var tiec = "..\\tiec\\compiler\\tiec.exe"
+if arg_count() >= 1 && !is_empty(arg_at(0)) {
+    tiec = arg_at(0)
+}
+
+var libroot = get_env("TIE_LIB_ROOT")
+if is_empty(libroot) {
+    libroot = "..\\..\\tlib"
+}
+if arg_count() >= 2 && !is_empty(arg_at(1)) {
+    libroot = arg_at(1)
+}
+
+// cmd 对「含 .. 的引号路径」会报"文件名语法不正确"（实测）——先 cd 到本仓根
+// 再以相对路径调用；lib-root 用相对（编译进程 cwd 已固定在仓根）。
+var cmd = "cd /d \"" + root + "\" && \"" + tiec + "\" server.tie -o tsp.exe --no-warn --lib-root \"" + libroot + "\""
+println("命令: " + cmd)
+var rc = exec_code(cmd)
+if rc == 0 {
+    println("=== 构建成功: tsp.exe ===")
+} else {
+    println("=== 构建失败（rc=" + to_string(rc) + "） ===")
+}
