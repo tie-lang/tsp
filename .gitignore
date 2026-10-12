@@ -13,6 +13,8 @@ _tmp_*
 
 # 探针与冒烟脚本（本地工作材料，不入库）
 probe_*.tie
+_probe_*.tie
 lsp_smoke*.py
 lsp_knobs.py
+_dbg*.py
 *.exe
