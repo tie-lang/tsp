@@ -18,14 +18,12 @@ type tie<logic>
 // 或随 server.tie 一起编译（server 是主入口，本文件被 import）。
 // ============================================================================
 
-import "../frontend/parser.tie"
-import "../frontend/semantic.tie"
+import "./tsp_ast.tie"
+import "./tsp_pkt.tie"
+import "./tsp_wire.tie"
 import "./protocol.tie" as proto
 
-// ---- 前端树跨层全局 shim ----
-// sinfer（frontend）引用 g_cur_fn_name，其声明在 backend/irgen.tie；
-// LSP 只 import frontend 树（不 import backend），此处补声明。
-var g_cur_fn_name: string = ""
+// （包化后无前端树 shim：数据来自 tsp_pkt 装载）
 
 // ---- AST 节点 tag 常量（对齐 frontend/ast.tie，本地定义防重复 import）----
 const AN_VAR: i64 = 6
@@ -54,6 +52,9 @@ var g_diag_uris: table<string>
 var g_diag_fps: table<string>
 var g_diag_json: table<string>
 var g_diag_ok: table<i64>
+
+// 当前装载指纹（run_check 的"已装载"判定；analyze_ex 成功装载时更新）
+var g_cur_loaded_fp: string = "";
 
 // 符号索引（每文档一段：扁平平行表 + 段偏移/计数）
 var g_iuris: table<string>
@@ -291,25 +292,51 @@ func an_substr(s: string, start: i64, end: i64) -> string {
 pub func analyze_ex(uri: string, txt: string, base_dir: string) -> (string, i64, i64) {
     var fp = fingerprint(txt)
     var idx = diag_find(uri)
-    if idx >= 0 && g_diag_fps[idx] == fp {
+    // 缓存命中须叠加「AST 在位」判据（g_cur_loaded_fp==fp）：release_now 释放后
+    // 指纹被清空，此处必须走重装——否则依赖 AST 的功能（folding/rename/
+    // semanticTokens 等经 run_check）拿到"缓存命中已 OK"却读到空 g_file_roots
+    // → 越界崩溃（2026-10-12 实测：folding×2 第二发必死于此）。
+    if idx >= 0 && g_diag_fps[idx] == fp && g_cur_loaded_fp == fp {
         return (g_diag_json[idx], g_diag_ok[idx], 0)
     }
-    // 剥离文件类型声明头部（type tie<X>），与真实管线同规则
-    var src = strip_type_decl(txt)
-    var prc = parser.parse_ast(src)
-    if prc < 0 {
-        var r1 = err_to_diag(parser.ast_err_protocol())
-        diag_set(uri, fp, r1, 0)
-        return (r1, 0, 1)
+    // 调前端分析服务（--tink-serve，一次性进程；tink v3 帧 + zd 记录）：
+    // stage 掩码 15 = tokens|ast|symtab|diag —— 诊断之外同时装载 AST/symtab
+    // 供符号索引与后续导航（与旧「parse+check 后索引」语义等价）。
+    var out: string = "[]"
+    var ok: i64 = 0
+    var (wrc, resp) = tsp_wire.analyze(tsp_wire.tiec_exe(), txt, base_dir, uri, 15)
+    if wrc == 0 {
+        var pos: i64 = 0
+        while pos < len(resp) {
+            var fr = tsp_wire.read_frame(resp, pos)
+            if fr.0 != 1 {
+                break
+            }
+            if tsp_wire.env_decode(fr.1) != 0 {
+                break
+            }
+            if w_kind == 3 {
+                if w_stage == 4 {
+                    if tsp_pkt.load_diag(w_pl) == 1 {
+                        out = diags_to_json()
+                    }
+                } else if w_stage == 2 {
+                    tsp_pkt.load_ast(w_pl)
+                } else if w_stage == 3 {
+                    tsp_pkt.load_sym(w_pl)
+                } else if w_stage == 1 {
+                    tsp_pkt.load_tokens(w_pl)
+                }
+            } else if w_kind == 7 {
+                ok = tsp_wire.done_ok(w_pl)
+            }
+            pos = fr.2
+        }
     }
-    var sem = semantic.check_ast(base_dir)
-    var out: string = ""
-    var ok: i64 = 1
-    if an_has_prefix(sem, "ERR:") {
-        out = err_to_diag(sem)
-        ok = 0
-    } else {
-        out = warns_to_diag(sem)
+    if ok == 1 {
+        // 装载成功 → 索引重建（主文件顶层声明；数据在 tsp_ast 容器）
+        index_doc(uri)
+        g_cur_loaded_fp = fp
     }
     diag_set(uri, fp, out, ok)
     return (out, ok, 1)
@@ -331,67 +358,51 @@ pub func analyze_doc(uri: string, txt: string, base_dir: string) -> string {
 // 成功返回 1（sstate 表为本文档最新状态）；词法/语法/语义错误返回 0。
 // 注意：不触碰诊断缓存（tsp_an 诊断表独立于 sstate）。
 pub func run_check(txt: string, base_dir: string) -> i64 {
-    var src = strip_type_decl(txt)
-    var prc = parser.parse_ast(src)
-    if prc < 0 {
-        return 0
+    // 包化模型：run_check 语义 = 「确保该文本对应的 AST/symtab 已完成装载」。
+    // 指纹命中当前装载（g_cur_loaded_fp）→ 直接 1；否则经 analyze_ex 走服务装载
+    // （uri 用保留键 "<nav>"，不污染真实文档诊断缓存）。
+    var fp = fingerprint(txt)
+    if g_cur_loaded_fp == fp {
+        return 1
     }
-    var sem = semantic.check_ast(base_dir)
-    if an_has_prefix(sem, "ERR:") {
-        return 0
-    }
-    return 1
+    var (j, ok, fresh) = analyze_ex("<nav>", txt, base_dir)
+    return ok
 }
 
-// 语义 OK 协议中的警告段 → 诊断数组（severity 2）。无警告返回 "[]"。
-// 字节级（警告消息含中文；str_char 中文字节位死循环）。
-// 推进方式对齐 driver.print_warns：每轮 rest = head（否则 p 相对 head 却
-// 套回 rest，死循环）。
-func warns_to_diag(sem: string) -> string {
-    var items: table<string> = table_new_string()
-    var rest = sem
-    var p = an_find_str(rest, ";W:")
-    while p >= 0 {
-        var head = an_substr(rest, p + 3, len(rest))
-        var sp1 = an_find_char(head, " ")
-        var sp2: i64 = -1
-        var i: i64 = 0
-        if sp1 >= 0 {
-            i = sp1 + 1
-            var hn: i64 = len(head)
-            while i < hn {
-                if str_byte(head, i) == 32 {
-                    sp2 = i
-                    break
-                }
-                i = i + 1
-            }
-        }
-        if sp1 >= 0 && sp2 >= 0 {
-            var line = an_parse_num(an_substr(head, 0, sp1))
-            var col = an_parse_num(an_substr(head, sp1 + 1, sp2))
-            var core = an_substr(head, sp2 + 1, len(head))
-            // 消息到下一个 ";W:" 前截断
-            var nx = an_find_str(core, ";W:")
-            if nx >= 0 {
-                core = an_substr(core, 0, nx)
-            }
-            table_push(items, mk_diag(line, col, core, 2))
-        }
-        rest = head
-        p = an_find_str(rest, ";W:")
-    }
+// 诊断投影：g_dg_*（tsp_pkt 从 diag 记录装载）→ LSP 诊断 JSON 数组。
+// message 取 211 渲染文本（含 E/W 前缀与建议）；severity：0=E→1、1=W→2；
+// 位置 1-based → 0-based（mk_diag 完成转换）。
+func diags_to_json() -> string {
     var out: string = "["
-    var k: i64 = 0
-    while k < len(items) {
-        if k > 0 {
+    var n = len(g_dg_line)
+    var i: i64 = 0
+    var first: bool = true
+    while i < n {
+        // 只报主文件（file_ids==0）的诊断——LSP 诊断归属「该文档」；库/依赖文件
+        // 的警告不经本文档上报（与旧管线行为一致；实测 smoke4 "ok 文档无诊断"）。
+        if len(g_dg_file_ids) > i && g_dg_file_ids[i] != 0 {
+            i = i + 1
+            continue
+        }
+        if !first {
             out = out + ","
         }
-        out = out + items[k]
-        k = k + 1
+        first = false
+        var sev: i64 = 1
+        if len(g_dg_sev) > i && g_dg_sev[i] == 1 {
+            sev = 2
+        }
+        var msg: string = ""
+        if len(g_dg_rendered) > i {
+            msg = g_dg_rendered[i]
+        }
+        if str_len(msg) == 0 && len(g_dg_codes) > i {
+            msg = g_dg_codes[i]
+        }
+        out = out + mk_diag(g_dg_line[i], g_dg_col[i], msg, sev)
+        i = i + 1
     }
-    out = out + "]"
-    return out
+    return out + "]"
 }
 
 // ==================== 符号索引（p.6.9.4 基础） ====================
@@ -569,13 +580,14 @@ func set_deps(uri: string) {
         }
         i = i + 1
     }
+    // 依赖清单 = 信封 files 表的 1..（0 = 主输入）——tsp_pkt 装载到 g_files。
     var list: string = ""
-    var k: i64 = 0
-    while k < len(g_imported) {
-        if k > 0 {
+    var k: i64 = 1
+    while k < len(g_files) {
+        if k > 1 {
             list = list + "\n"
         }
-        list = list + g_imported[k]
+        list = list + g_files[k]
         k = k + 1
     }
     if idx >= 0 {
@@ -1006,8 +1018,12 @@ pub func release_now() {
         return
     }
     g_rel_gens = g_rel_gens + 1
-    g_rel_nodes = g_rel_nodes + s_n
-    semantic.release_ast()
+    g_rel_nodes = g_rel_nodes + len(s_tags)
+    tsp_ast.reset()
+    // ★ 装载指纹同步作废：AST 已释放，run_check 的「指纹命中」不得再短路——
+    // 否则依赖 AST 的功能（references/语义令牌等）读到空 g_file_roots 越界崩溃
+    // （2026-10-12 实测：references 在 release 后死锁在 g_file_roots[0]）。
+    g_cur_loaded_fp = ""
 }
 
 pub func release_gens() -> i64 {

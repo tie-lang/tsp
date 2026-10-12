@@ -1,0 +1,434 @@
+type tie<logic>
+// tsp_pkt.tie —— 结构化包装载器（zd 记录 → tsp_ast 容器）
+// ============================================================================
+// namespace：tsp_pkt
+// 依赖：tlib /std/zd.tie（zd 原语）· ./tsp_ast.tie（装载目标 + 顶层清空工具）。
+//
+// 输入 = 结构化包的单个阶段记录（zd 字节表；来自 tink stage 帧 payload 或
+// `--emit` 落盘的 .zd 文件）。记录结构（p.9.22 dbgem）：
+//   信封：1 schema · 2 stage · 3 unit · 4 strings（池；装载侧跳过——列已是
+//         展开文本）· 5 files（文件表，0=主输入）
+//   列段：字段号 >= 100，值为 zd 数组（i64 列或文本列）；字段号只追加。
+//
+// 装载策略：
+//   · 全部「就地清空 + 复用」目标表（长驻服务不泄漏；见 tsp_ast 顶层工具）；
+//   · ast 101（names）文本 → intern 回 id（与旧前端语义一致：s_names 存池 id
+//     且 `intern.lookup` 同源可用）；空串 → -1（无名字；lookup 同为 ""）；
+//   · 主文件根推导：主文件段尾（首个 file_id != 0 的节点 id - 1；全 0 → 末
+//     节点）——parse 产物「根最后分配」；实测两例（含/不含 import）段尾均为
+//     顶层 StmtList（tag 122）；
+//   · 其它文本列（symtab 名字、tokens 文本）装载为字符串表（新消费直接取文本）。
+//
+// 返回：1 成功 / 0 记录结构非法（缺列头/越界；已装载部分保持，由调用方丢弃）。
+
+import "/std/zd.tie" as zd
+import "./tsp_ast.tie"
+
+namespace tsp_pkt {
+
+// ---------- 记录字段遍历 ----------
+
+// 读一字段头 → (fno, vs, ve, next)；失败 (0, -1, -1, -1)。
+// 字段封装 = varint(fno<<3|2) + varint(payload len) + payload。
+func next_field(rec: table<i64>, pos: i64) -> (i64, i64, i64, i64) {
+    var f = zd.decode_field(rec, pos)
+    var p1 = f.2
+    if p1 < 0 {
+        return (0, -1, -1, -1)
+    }
+    var lr = zd.read_varint(rec, p1)
+    if lr.1 < 0 || lr.0 < 0 || lr.1 + lr.0 > len(rec) {
+        return (0, -1, -1, -1)
+    }
+    return (f.0, lr.1, lr.1 + lr.0, lr.1 + lr.0)
+}
+
+// ---------- 列解码（追加到 ref 目标；调用方（装载入口）已先清空目标） ----------
+
+// i64 列：array_tag(n) + n × decode_i64。
+func rd_col_i64(rec: table<i64>, vs: i64, ve: i64, t: ref table<i64>) -> i64 {
+    var at = zd.array_tag(rec, vs)
+    if at.0 < 0 {
+        return 0
+    }
+    var n = at.0
+    var p = at.1
+    var i: i64 = 0
+    while i < n {
+        var d = zd.decode_i64(rec, p)
+        if d.1 < 0 {
+            return 0
+        }
+        table_push(t, d.0)
+        p = d.1
+        i = i + 1
+    }
+    return 1
+}
+
+// 文本列（intern 回 id）：空串 → -1（无名字；lookup 与 "" 同效）。
+func rd_col_ids(rec: table<i64>, vs: i64, ve: i64, t: ref table<i64>) -> i64 {
+    var at = zd.array_tag(rec, vs)
+    if at.0 < 0 {
+        return 0
+    }
+    var n = at.0
+    var p = at.1
+    var i: i64 = 0
+    while i < n {
+        var d = zd.decode_string(rec, p)
+        if d.1 < 0 {
+            return 0
+        }
+        var s = d.0
+        if str_len(s) == 0 {
+            table_push(t, -1)
+        } else {
+            table_push(t, intern.intern(s))
+        }
+        p = d.1
+        i = i + 1
+    }
+    return 1
+}
+
+// 文本列（原文）：直接装字符串。
+func rd_col_str(rec: table<i64>, vs: i64, ve: i64, t: ref table<string>) -> i64 {
+    var at = zd.array_tag(rec, vs)
+    if at.0 < 0 {
+        return 0
+    }
+    var n = at.0
+    var p = at.1
+    var i: i64 = 0
+    while i < n {
+        var d = zd.decode_string(rec, p)
+        if d.1 < 0 {
+            return 0
+        }
+        table_push(t, d.0)
+        p = d.1
+        i = i + 1
+    }
+    return 1
+}
+
+// ---------- 主文件根推导 ----------
+
+// 主文件段尾：首个 file_id != 0 的节点 id - 1；全 0（无 import）→ 末节点。
+// parse 产物「根最后分配」，故段尾即主文件顶层节点（StmtList）。
+func main_root_of() -> i64 {
+    var n = len(s_file_ids)
+    if n == 0 {
+        return -1
+    }
+    var i: i64 = 0
+    while i < n {
+        if s_file_ids[i] != 0 {
+            return i - 1
+        }
+        i = i + 1
+    }
+    return n - 1
+}
+
+// ---------- 装载：ast ----------
+
+pub func load_ast(rec: table<i64>) -> i64 {
+    tsp_ast.reset()
+    var pos: i64 = 0
+    var n = len(rec)
+    while pos < n {
+        var fx = next_field(rec, pos)
+        if fx.1 < 0 {
+            return 0
+        }
+        var fno = fx.0
+        var vs = fx.1
+        var ve = fx.2
+        if fno == 100 {
+            if rd_col_i64(rec, vs, ve, s_tags) == 0 {
+                return 0
+            }
+        } else if fno == 101 {
+            if rd_col_ids(rec, vs, ve, s_names) == 0 {
+                return 0
+            }
+        } else if fno == 102 {
+            if rd_col_i64(rec, vs, ve, s_vals) == 0 {
+                return 0
+            }
+        } else if fno == 103 {
+            if rd_col_i64(rec, vs, ve, s_aux) == 0 {
+                return 0
+            }
+        } else if fno == 104 {
+            if rd_col_i64(rec, vs, ve, s_coff) == 0 {
+                return 0
+            }
+        } else if fno == 105 {
+            if rd_col_i64(rec, vs, ve, s_nchild) == 0 {
+                return 0
+            }
+        } else if fno == 106 {
+            if rd_col_i64(rec, vs, ve, s_children) == 0 {
+                return 0
+            }
+        } else if fno == 107 {
+            if rd_col_i64(rec, vs, ve, s_lines) == 0 {
+                return 0
+            }
+        } else if fno == 108 {
+            if rd_col_i64(rec, vs, ve, s_cols) == 0 {
+                return 0
+            }
+        } else if fno == 109 {
+            if rd_col_i64(rec, vs, ve, s_file_ids) == 0 {
+                return 0
+            }
+        } else if fno == 5 {
+            if rd_col_str(rec, vs, ve, g_files) == 0 {
+                return 0
+            }
+        }
+        pos = fx.3
+    }
+    g_main_root = main_root_of()
+    tsp_clear_i64(g_file_roots)
+    table_push(g_file_roots, g_main_root)
+    return 1
+}
+
+// ---------- 装载：diag（200-211；LSP 投影所需列） ----------
+
+pub func load_diag(rec: table<i64>) -> i64 {
+    tsp_ast.reset_diag()
+    var pos: i64 = 0
+    var n = len(rec)
+    while pos < n {
+        var fx = next_field(rec, pos)
+        if fx.1 < 0 {
+            return 0
+        }
+        var fno = fx.0
+        var vs = fx.1
+        var ve = fx.2
+        if fno == 200 {
+            if rd_col_str(rec, vs, ve, g_dg_codes) == 0 {
+                return 0
+            }
+        } else if fno == 201 {
+            if rd_col_i64(rec, vs, ve, g_dg_sev) == 0 {
+                return 0
+            }
+        } else if fno == 202 {
+            if rd_col_i64(rec, vs, ve, g_dg_line) == 0 {
+                return 0
+            }
+        } else if fno == 203 {
+            if rd_col_i64(rec, vs, ve, g_dg_col) == 0 {
+                return 0
+            }
+        } else if fno == 204 {
+            if rd_col_i64(rec, vs, ve, g_dg_el) == 0 {
+                return 0
+            }
+        } else if fno == 205 {
+            if rd_col_i64(rec, vs, ve, g_dg_ec) == 0 {
+                return 0
+            }
+        } else if fno == 210 {
+            if rd_col_i64(rec, vs, ve, g_dg_file_ids) == 0 {
+                return 0
+            }
+        } else if fno == 211 {
+            if rd_col_str(rec, vs, ve, g_dg_rendered) == 0 {
+                return 0
+            }
+        }
+        pos = fx.3
+    }
+    return 1
+}
+
+// ---------- 装载：tokens（300-303） ----------
+
+pub func load_tokens(rec: table<i64>) -> i64 {
+    tsp_ast.reset_tokens()
+    var pos: i64 = 0
+    var n = len(rec)
+    while pos < n {
+        var fx = next_field(rec, pos)
+        if fx.1 < 0 {
+            return 0
+        }
+        var fno = fx.0
+        var vs = fx.1
+        var ve = fx.2
+        if fno == 300 {
+            if rd_col_i64(rec, vs, ve, tk_kinds) == 0 {
+                return 0
+            }
+        } else if fno == 301 {
+            if rd_col_str(rec, vs, ve, tk_text) == 0 {
+                return 0
+            }
+        } else if fno == 302 {
+            if rd_col_i64(rec, vs, ve, tk_lines) == 0 {
+                return 0
+            }
+        } else if fno == 303 {
+            if rd_col_i64(rec, vs, ve, tk_cols) == 0 {
+                return 0
+            }
+        }
+        pos = fx.3
+    }
+    return 1
+}
+
+// ---------- 装载：symtab（120-198） ----------
+
+pub func load_sym(rec: table<i64>) -> i64 {
+    tsp_ast.reset_sym()
+    var pos: i64 = 0
+    var n = len(rec)
+    while pos < n {
+        var fx = next_field(rec, pos)
+        if fx.1 < 0 {
+            return 0
+        }
+        var fno = fx.0
+        var vs = fx.1
+        var ve = fx.2
+        // 名字/文本列（string）
+        if fno == 120 {
+            if rd_col_str(rec, vs, ve, sym_gb_names) == 0 {
+                return 0
+            }
+        } else if fno == 124 {
+            if rd_col_str(rec, vs, ve, sym_ext_names) == 0 {
+                return 0
+            }
+        } else if fno == 125 {
+            if rd_col_str(rec, vs, ve, sym_tre_names) == 0 {
+                return 0
+            }
+        } else if fno == 150 {
+            if rd_col_str(rec, vs, ve, sym_fn_names) == 0 {
+                return 0
+            }
+        } else if fno == 165 {
+            if rd_col_str(rec, vs, ve, sym_st_names) == 0 {
+                return 0
+            }
+        } else if fno == 170 {
+            if rd_col_str(rec, vs, ve, sym_fld_names) == 0 {
+                return 0
+            }
+        } else if fno == 175 {
+            if rd_col_str(rec, vs, ve, sym_en_names) == 0 {
+                return 0
+            }
+        } else if fno == 179 {
+            if rd_col_str(rec, vs, ve, sym_en_vnames) == 0 {
+                return 0
+            }
+        } else if fno == 185 {
+            if rd_col_str(rec, vs, ve, sym_alias_names) == 0 {
+                return 0
+            }
+        } else if fno == 190 {
+            if rd_col_str(rec, vs, ve, xref_decl_names) == 0 {
+                return 0
+            }
+        // i64 列
+        } else if fno == 121 {
+            if rd_col_i64(rec, vs, ve, sym_gb_tys) == 0 { return 0 }
+        } else if fno == 122 {
+            if rd_col_i64(rec, vs, ve, sym_gb_const) == 0 { return 0 }
+        } else if fno == 123 {
+            if rd_col_i64(rec, vs, ve, sym_gb_telem) == 0 { return 0 }
+        } else if fno == 126 {
+            if rd_col_i64(rec, vs, ve, sym_tre_vals) == 0 { return 0 }
+        } else if fno == 151 {
+            if rd_col_i64(rec, vs, ve, sym_fn_sig_ids) == 0 { return 0 }
+        } else if fno == 152 {
+            if rd_col_i64(rec, vs, ve, sym_fn_def_nodes) == 0 { return 0 }
+        } else if fno == 153 {
+            if rd_col_i64(rec, vs, ve, sym_fn_mods) == 0 { return 0 }
+        } else if fno == 154 {
+            if rd_col_i64(rec, vs, ve, sym_sg_nparams) == 0 { return 0 }
+        } else if fno == 155 {
+            if rd_col_i64(rec, vs, ve, sym_sg_required) == 0 { return 0 }
+        } else if fno == 156 {
+            if rd_col_i64(rec, vs, ve, sym_sg_ret) == 0 { return 0 }
+        } else if fno == 157 {
+            if rd_col_i64(rec, vs, ve, sym_sg_pub) == 0 { return 0 }
+        } else if fno == 158 {
+            if rd_col_i64(rec, vs, ve, sym_sg_off) == 0 { return 0 }
+        } else if fno == 159 {
+            if rd_col_i64(rec, vs, ve, sym_sg_gen) == 0 { return 0 }
+        } else if fno == 160 {
+            if rd_col_i64(rec, vs, ve, sym_sp_tys) == 0 { return 0 }
+        } else if fno == 161 {
+            if rd_col_i64(rec, vs, ve, sym_sp_refs) == 0 { return 0 }
+        } else if fno == 162 {
+            if rd_col_i64(rec, vs, ve, sym_sp_defs) == 0 { return 0 }
+        } else if fno == 163 {
+            if rd_col_i64(rec, vs, ve, sym_sp_vars) == 0 { return 0 }
+        } else if fno == 166 {
+            if rd_col_i64(rec, vs, ve, sym_st_parent) == 0 { return 0 }
+        } else if fno == 167 {
+            if rd_col_i64(rec, vs, ve, sym_st_fldoff) == 0 { return 0 }
+        } else if fno == 168 {
+            if rd_col_i64(rec, vs, ve, sym_st_nfld) == 0 { return 0 }
+        } else if fno == 169 {
+            if rd_col_i64(rec, vs, ve, sym_st_reprc) == 0 { return 0 }
+        } else if fno == 171 {
+            if rd_col_i64(rec, vs, ve, sym_fld_tys) == 0 { return 0 }
+        } else if fno == 172 {
+            if rd_col_i64(rec, vs, ve, sym_fld_defs) == 0 { return 0 }
+        } else if fno == 176 {
+            if rd_col_i64(rec, vs, ve, sym_en_nvar) == 0 { return 0 }
+        } else if fno == 177 {
+            if rd_col_i64(rec, vs, ve, sym_en_varoff) == 0 { return 0 }
+        } else if fno == 178 {
+            if rd_col_i64(rec, vs, ve, sym_en_nslot) == 0 { return 0 }
+        } else if fno == 180 {
+            if rd_col_i64(rec, vs, ve, sym_en_vtags) == 0 { return 0 }
+        } else if fno == 181 {
+            if rd_col_i64(rec, vs, ve, sym_en_vfldoff) == 0 { return 0 }
+        } else if fno == 182 {
+            if rd_col_i64(rec, vs, ve, sym_en_vnfld) == 0 { return 0 }
+        } else if fno == 183 {
+            if rd_col_i64(rec, vs, ve, sym_en_ftys) == 0 { return 0 }
+        } else if fno == 186 {
+            if rd_col_i64(rec, vs, ve, sym_alias_nodes) == 0 { return 0 }
+        } else if fno == 188 {
+            if rd_col_i64(rec, vs, ve, xref_scope_parent) == 0 { return 0 }
+        } else if fno == 189 {
+            if rd_col_i64(rec, vs, ve, xref_scope_owner) == 0 { return 0 }
+        } else if fno == 191 {
+            if rd_col_i64(rec, vs, ve, xref_decl_kinds) == 0 { return 0 }
+        } else if fno == 192 {
+            if rd_col_i64(rec, vs, ve, xref_decl_tys) == 0 { return 0 }
+        } else if fno == 193 {
+            if rd_col_i64(rec, vs, ve, xref_decl_scopes) == 0 { return 0 }
+        } else if fno == 194 {
+            if rd_col_i64(rec, vs, ve, xref_decl_nodes) == 0 { return 0 }
+        } else if fno == 195 {
+            if rd_col_i64(rec, vs, ve, xref_decl_lines) == 0 { return 0 }
+        } else if fno == 196 {
+            if rd_col_i64(rec, vs, ve, xref_decl_cols) == 0 { return 0 }
+        } else if fno == 197 {
+            if rd_col_i64(rec, vs, ve, xref_use_nodes) == 0 { return 0 }
+        } else if fno == 198 {
+            if rd_col_i64(rec, vs, ve, xref_use_decls) == 0 { return 0 }
+        }
+        pos = fx.3
+    }
+    return 1
+}
+
+}   // namespace tsp_pkt

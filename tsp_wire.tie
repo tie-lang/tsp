@@ -1,0 +1,551 @@
+type tie<logic>
+// tsp_wire.tie —— tink v3 帧收发（tsp ↔ 前端分析服务）
+// ============================================================================
+// namespace：tsp_wire
+// 与 tiec `--tink-serve`（compiler/driver/serve.tie）对偶。字节一律用 table<i64>
+// （0..255）承载（与 tinker_frame 同路线：str_from_code 是码点编码、不能当裸字节
+// 用；任意字节流必须走字节表）。分片/重组与 tinker 逐字节同源。
+//
+//   发送：analyze 请求帧（信封 kind=6）——payload 字段 f1=src f2=base_dir
+//         f3=vpath f4=stages。src 以原始字节段内嵌（str8/16/32 头 + UTF-8 字节）。
+//   接收：应答帧流——stage 帧（kind=3, stage 1/2/3/4, payload=zd 记录字节）+
+//         完成帧（kind=7, payload f1=ok f2=vpath）。
+//   进程：临时文件交换（byte_write 请求 → exec_code 重定向 → byte_read 应答；
+//         stderr 单独丢弃——stdout 必须纯净为帧流）。
+//
+// 帧格式（16B 定长头 + 载荷 + 尾 CRC32C；大载荷自动分片）：
+//   [magic 74 6B][ver 3][type 04][flags u16 BE][stream u32=0][seq u32 BE]
+//   [len u16 BE]；载荷；CRC32C(头‖载荷) 4B BE。
+//   flags：4=CRC 8=FIN 16=OFFSET（分片：载荷前 4B BE 偏移，末片 FIN）。
+//
+// tiec 路径解析：TSP_TIEC 环境变量 > 相对 ../tiec/compiler/tiec.exe > "tiec"。
+
+// ==================== 模块全局（namespace 体内不允许 var，置顶层） ====================
+var w_crc_tab: table<i64>;
+var w_crc_ready: i64 = 0;
+// 信封解码结果槽（最近一帧）
+var w_kind: i64 = -1;
+var w_stage: i64 = 0;
+var w_name: string = "";
+var w_pl: table<i64>;
+
+namespace tsp_wire {
+
+// ==================== 配置 ====================
+
+pub func tiec_exe() -> string {
+    var p = get_env("TSP_TIEC")
+    if str_len(p) > 0 {
+        return p
+    }
+    if file_exists("../tiec/compiler/tiec.exe") {
+        return "../tiec/compiler/tiec.exe"
+    }
+    return "tiec"
+}
+
+// ==================== 字节工具 ====================
+
+// 字符串 → 原始字节表（装载/发送侧的边界转换；逐字节 O(n)）。
+pub func bytes_of(s: string) -> table<i64> {
+    var out = table_new_i64()
+    var n = len(s)
+    var i: i64 = 0
+    while i < n {
+        table_push(out, str_byte(s, i))
+        i = i + 1
+    }
+    return out
+}
+
+// 无符号字节（越界 → -1）。
+func rd_u8(t: table<i64>, i: i64) -> i64 {
+    if i < 0 || i >= len(t) {
+        return -1
+    }
+    return t[i]
+}
+
+// ==================== CRC32C（与 tinker 查表逐字节一致） ====================
+
+func crc_tab_build() {
+    w_crc_tab = table_new_i64()
+    var i: i64 = 0
+    while i < 256 {
+        var c: i64 = i
+        var k: i64 = 0
+        while k < 8 {
+            var lsb: i64 = c & 1
+            c = c >> 1
+            if lsb != 0 {
+                c = c ^ 0x82F63B78
+            }
+            k = k + 1
+        }
+        table_push(w_crc_tab, c)
+        i = i + 1
+    }
+    w_crc_ready = 1
+}
+
+pub func crc32c_t(t: table<i64>, a: i64, b: i64) -> i64 {
+    if w_crc_ready == 0 {
+        crc_tab_build()
+    }
+    var c: i64 = 0xFFFFFFFF
+    var i: i64 = a
+    while i < b {
+        var x = t[i]
+        if x < 0 || x > 255 {
+            x = 0
+        }
+        c = (c >> 8) ^ w_crc_tab[(c ^ x) & 0xFF]
+        i = i + 1
+    }
+    return c ^ 0xFFFFFFFF
+}
+
+// ==================== 片段编码（push 式直写） ====================
+
+func push_be16(dst: ref table<i64>, v: i64) {
+    table_push(dst, (v >> 8) & 0xFF)
+    table_push(dst, v & 0xFF)
+}
+
+func push_be32(dst: ref table<i64>, v: i64) {
+    table_push(dst, (v >> 24) & 0xFF)
+    table_push(dst, (v >> 16) & 0xFF)
+    table_push(dst, (v >> 8) & 0xFF)
+    table_push(dst, v & 0xFF)
+}
+
+// varint（LEB128）。
+func push_varint(dst: ref table<i64>, n: i64) {
+    var v = n
+    while v >= 0x80 {
+        table_push(dst, (v & 0x7F) | 0x80)
+        v = v >> 7
+    }
+    table_push(dst, v)
+}
+
+// 字符串（fixstr/str8/16/32 头 + UTF-8 字节）——src 等以字节段内嵌。
+func push_str_bytes(dst: ref table<i64>, s: string) {
+    var n = len(s)
+    if n <= 31 {
+        table_push(dst, 0xA0 | n)
+    } else if n <= 255 {
+        table_push(dst, 0xD9)
+        table_push(dst, n)
+    } else if n <= 65535 {
+        table_push(dst, 0xDA)
+        push_be16(dst, n)
+    } else {
+        table_push(dst, 0xDB)
+        push_be32(dst, n)
+    }
+    var i: i64 = 0
+    while i < n {
+        table_push(dst, str_byte(s, i))
+        i = i + 1
+    }
+}
+
+// 字段：varint(fno<<3|2) + varint(len) + payload。
+func push_field(dst: ref table<i64>, fno: i64, payload: table<i64>) {
+    push_varint(dst, fno * 8 + 2)
+    push_varint(dst, len(payload))
+    var i: i64 = 0
+    while i < len(payload) {
+        table_push(dst, payload[i])
+        i = i + 1
+    }
+}
+
+// i64 值载荷（最短编码：fixint / 0xCC u8 / 0xCF u64）→ 新表。
+func i64_payload(v: i64) -> table<i64> {
+    var out = table_new_i64()
+    if v >= 0 && v <= 127 {
+        table_push(out, v)
+    } else if v >= -32 && v < 0 {
+        table_push(out, v & 0xFF)
+    } else if v >= 128 && v <= 255 {
+        table_push(out, 0xCC)
+        table_push(out, v)
+    } else {
+        table_push(out, 0xCF)
+        push_be32(out, (v >> 32) & 0xFFFFFFFF)
+        push_be32(out, v & 0xFFFFFFFF)
+    }
+    return out
+}
+
+// 字符串值载荷（头 + UTF-8 字节）→ 新表。
+func str_payload(s: string) -> table<i64> {
+    var out = table_new_i64()
+    push_str_bytes(out, s)
+    return out
+}
+
+// ==================== 帧编码 ====================
+
+// 单帧组装（无扩展区）→ 帧字节表。
+func frame_one_t(payload: table<i64>, flags: i64, seq: i64) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, 0x74)
+    table_push(out, 0x6B)
+    table_push(out, 3)
+    table_push(out, 0x04)
+    table_push(out, (flags >> 8) & 0xFF)
+    table_push(out, flags & 0xFF)
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, 0)
+    table_push(out, (seq >> 24) & 0xFF)
+    table_push(out, (seq >> 16) & 0xFF)
+    table_push(out, (seq >> 8) & 0xFF)
+    table_push(out, seq & 0xFF)
+    push_be16(out, len(payload))
+    var i: i64 = 0
+    while i < len(payload) {
+        table_push(out, payload[i])
+        i = i + 1
+    }
+    var c = crc32c_t(out, 0, len(out))
+    push_be32(out, c)
+    return out
+}
+
+// 帧编码：逻辑载荷 → 单帧或分片帧流（>65531B 自动分片，同 tinker 规则）。
+pub func frame_encode_t(payload: table<i64>) -> table<i64> {
+    var total = len(payload)
+    if total <= 65531 {
+        return frame_one_t(payload, 4 | 8, 0)
+    }
+    var out = table_new_i64()
+    var c: i64 = 65531
+    var nf = total / c
+    if nf * c < total {
+        nf = nf + 1
+    }
+    var i: i64 = 0
+    while i < nf {
+        var cs = i * c
+        var ce = cs + c
+        if ce > total {
+            ce = total
+        }
+        var body = table_new_i64()
+        push_be32(body, cs)
+        var j: i64 = cs
+        while j < ce {
+            table_push(body, payload[j])
+            j = j + 1
+        }
+        var fl: i64 = 4 | 16
+        if i == nf - 1 {
+            fl = fl | 8
+        }
+        var fr = frame_one_t(body, fl, i)
+        var k: i64 = 0
+        while k < len(fr) {
+            table_push(out, fr[k])
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ==================== 请求组装 ====================
+
+// analyze 请求帧（信封 kind=6）：f1=src f2=base_dir f3=vpath f4=stages。
+pub func analyze_request(src: string, base: string, vpath: string, stages: i64) -> table<i64> {
+    var inner = table_new_i64()
+    push_field(inner, 1, str_payload(src))
+    push_field(inner, 2, str_payload(base))
+    push_field(inner, 3, str_payload(vpath))
+    push_field(inner, 4, i64_payload(stages))
+    var env = table_new_i64()
+    push_field(env, 1, i64_payload(6))
+    push_field(env, 2, i64_payload(0))
+    push_field(env, 3, str_payload("analyze"))
+    push_field(env, 4, inner)
+    return frame_encode_t(env)
+}
+
+// ==================== 应答解析 ====================
+
+// 读一原始帧 → (ok, flags, payload, next)：
+//   ok=1 成功 / ok=0 缓冲不足 / ok=-1 帧非法（头或 CRC 错）。
+func read_raw(t: table<i64>, pos: i64) -> (i64, i64, table<i64>, i64) {
+    var nb = len(t)
+    if pos + 16 > nb {
+        return (0, 0, table_new_i64(), nb)
+    }
+    if rd_u8(t, pos) != 0x74 || rd_u8(t, pos + 1) != 0x6B || rd_u8(t, pos + 2) != 3 || rd_u8(t, pos + 3) != 0x04 {
+        return (-1, 0, table_new_i64(), pos)
+    }
+    var fl = (rd_u8(t, pos + 4) << 8) | rd_u8(t, pos + 5)
+    if (fl & 0xFFC0) != 0 || (fl & 1) != 0 || (fl & 2) != 0 {
+        return (-1, 0, table_new_i64(), pos)
+    }
+    var ln = (rd_u8(t, pos + 14) << 8) | rd_u8(t, pos + 15)
+    var tlen: i64 = 0
+    if (fl & 4) != 0 {
+        tlen = 4
+    }
+    if pos + 16 + ln + tlen > nb {
+        return (0, 0, table_new_i64(), nb)
+    }
+    if tlen == 4 {
+        var q = pos + 16 + ln
+        var want = (rd_u8(t, q) << 24) | (rd_u8(t, q + 1) << 16) | (rd_u8(t, q + 2) << 8) | rd_u8(t, q + 3)
+        if want != crc32c_t(t, pos, q) {
+            return (-1, 0, table_new_i64(), pos)
+        }
+    }
+    var pl = table_new_i64()
+    var i: i64 = pos + 16
+    while i < pos + 16 + ln {
+        table_push(pl, t[i])
+        i = i + 1
+    }
+    return (1, fl, pl, pos + 16 + ln + tlen)
+}
+
+// 读一逻辑帧（分片自动重组；校验偏移连续）→ (ok, payload, next)。
+pub func read_frame(t: table<i64>, pos: i64) -> (i64, table<i64>, i64) {
+    var r = read_raw(t, pos)
+    if r.0 != 1 {
+        return (r.0, table_new_i64(), pos)
+    }
+    var fl0 = r.1
+    var pl0 = r.2
+    var nx = r.3
+    if (fl0 & 16) == 0 {
+        return (1, pl0, nx)
+    }
+    if len(pl0) < 4 {
+        return (-1, table_new_i64(), pos)
+    }
+    var off0 = (rd_u8(pl0, 0) << 24) | (rd_u8(pl0, 1) << 16) | (rd_u8(pl0, 2) << 8) | rd_u8(pl0, 3)
+    if off0 != 0 {
+        return (-1, table_new_i64(), pos)
+    }
+    var out = table_new_i64()
+    var j: i64 = 4
+    while j < len(pl0) {
+        table_push(out, pl0[j])
+        j = j + 1
+    }
+    var fin: i64 = 0
+    if (fl0 & 8) != 0 {
+        fin = 1
+    }
+    while fin == 0 {
+        var r2 = read_raw(t, nx)
+        if r2.0 == 0 {
+            return (0, table_new_i64(), pos)
+        }
+        if r2.0 < 0 {
+            return (-1, table_new_i64(), pos)
+        }
+        var fl2 = r2.1
+        var pl2 = r2.2
+        if (fl2 & 16) == 0 || len(pl2) < 4 {
+            return (-1, table_new_i64(), pos)
+        }
+        var off2 = (rd_u8(pl2, 0) << 24) | (rd_u8(pl2, 1) << 16) | (rd_u8(pl2, 2) << 8) | rd_u8(pl2, 3)
+        if off2 != len(out) {
+            return (-1, table_new_i64(), pos)
+        }
+        var j2: i64 = 4
+        while j2 < len(pl2) {
+            table_push(out, pl2[j2])
+            j2 = j2 + 1
+        }
+        nx = r2.3
+        if (fl2 & 8) != 0 {
+            fin = 1
+        }
+    }
+    return (1, out, nx)
+}
+
+// ---------- 信封 / 字段解码 ----------
+
+func rd_varint(t: table<i64>, pos: i64) -> (i64, i64) {
+    var v: i64 = 0
+    var shift: i64 = 0
+    var i = pos
+    var nb = len(t)
+    while i < nb {
+        var b = rd_u8(t, i)
+        v = v | ((b & 0x7F) << shift)
+        if (b & 0x80) == 0 {
+            return (v, i + 1)
+        }
+        shift = shift + 7
+        if shift > 63 {
+            return (0, -1)
+        }
+        i = i + 1
+    }
+    return (0, -1)
+}
+
+// 字符串值（fixstr/str8/16/32 头 + UTF-8 正文）→ 字符串。
+func rd_str(t: table<i64>, start: i64, end: i64) -> string {
+    if start >= end {
+        return ""
+    }
+    var h0 = rd_u8(t, start)
+    var hw: i64 = 1
+    if h0 == 0xD9 {
+        hw = 2
+    } else if h0 == 0xDA {
+        hw = 3
+    } else if h0 == 0xDB {
+        hw = 5
+    }
+    var sb = string_builder()
+    var bi = start + hw
+    while bi < end {
+        var b0 = rd_u8(t, bi)
+        var cp: i64 = b0
+        var adv: i64 = 1
+        if b0 >= 0xF0 {
+            if bi + 3 >= end {
+                break
+            }
+            cp = ((b0 & 0x07) << 18) | ((rd_u8(t, bi + 1) & 0x3F) << 12) | ((rd_u8(t, bi + 2) & 0x3F) << 6) | (rd_u8(t, bi + 3) & 0x3F)
+            adv = 4
+        } else if b0 >= 0xE0 {
+            if bi + 2 >= end {
+                break
+            }
+            cp = ((b0 & 0x0F) << 12) | ((rd_u8(t, bi + 1) & 0x3F) << 6) | (rd_u8(t, bi + 2) & 0x3F)
+            adv = 3
+        } else if b0 >= 0xC0 {
+            if bi + 1 >= end {
+                break
+            }
+            cp = ((b0 & 0x1F) << 6) | (rd_u8(t, bi + 1) & 0x3F)
+            adv = 2
+        }
+        sb_append(sb, str_from_code(cp))
+        bi = bi + adv
+    }
+    return sb_build(sb)
+}
+
+// 信封解码（帧 payload → 槽）。返回 0 成功 / -1 失败。
+pub func env_decode(p: table<i64>) -> i64 {
+    w_kind = -1
+    w_stage = 0
+    w_name = ""
+    w_pl = table_new_i64()
+    var nb = len(p)
+    var pos: i64 = 0
+    while pos < nb {
+        var tr = rd_varint(p, pos)
+        if tr.1 < 0 {
+            return -1
+        }
+        var lr = rd_varint(p, tr.1)
+        if lr.1 < 0 || lr.0 < 0 || lr.1 + lr.0 > nb {
+            return -1
+        }
+        var fno = tr.0 >> 3
+        var vs = lr.1
+        var ve = lr.1 + lr.0
+        if fno == 1 {
+            var vr = rd_varint(p, vs)
+            w_kind = vr.0
+        } else if fno == 2 {
+            var vr2 = rd_varint(p, vs)
+            w_stage = vr2.0
+        } else if fno == 3 {
+            w_name = rd_str(p, vs, ve)
+        } else if fno == 4 {
+            var out = table_new_i64()
+            var j = vs
+            while j < ve {
+                table_push(out, p[j])
+                j = j + 1
+            }
+            w_pl = out
+        }
+        pos = ve
+    }
+    if w_kind < 0 {
+        return -1
+    }
+    return 0
+}
+
+// done 帧载荷解析：f1=ok（0/1）。失败返回 0。
+pub func done_ok(p: table<i64>) -> i64 {
+    var nb = len(p)
+    var pos: i64 = 0
+    while pos < nb {
+        var tr = rd_varint(p, pos)
+        if tr.1 < 0 {
+            return 0
+        }
+        var lr = rd_varint(p, tr.1)
+        if lr.1 < 0 || lr.0 < 0 || lr.1 + lr.0 > nb {
+            return 0
+        }
+        if (tr.0 >> 3) == 1 {
+            var vr = rd_varint(p, lr.1)
+            if vr.1 < 0 {
+                return 0
+            }
+            return vr.0
+        }
+        pos = lr.1 + lr.0
+    }
+    return 0
+}
+
+// ==================== 端到端：一次分析请求 ====================
+
+// exe 绝对化：cmd 对「相对命令路径」不可靠（引号+相对路径实测被拆坏——cmd 把
+// `"../x.exe"` 与裸 `../x.exe` 都误判为命令 '..' 找不到）；「绝对路径 + 引号」
+// 为稳定形态（实测）。无盘符且非根开头时以 cwd 拼接。
+func abs_exe(exe: string) -> string {
+    // 盘符（x:）或根（/）开关视为绝对（str_byte 逐字节判，不依赖应用层字符串库）。
+    if str_len(exe) >= 2 && str_byte(exe, 1) == 58 {
+        return exe
+    }
+    if str_len(exe) > 0 && str_byte(exe, 0) == 47 {
+        return exe
+    }
+    return cwd() + "/" + exe
+}
+
+// analyze：临时文件交换（请求 → 服务进程 → 应答）；stderr 单独丢弃（stdout 必须
+// 纯净为帧流）。返回 (rc, resp)：rc = 进程退出码；resp = 应答帧流字节表。
+// 注：exe 路径不得含空格（cmd 引号边界，v1 已知限制）。
+pub func analyze(exe: string, src: string, base: string, vpath: string, stages: i64) -> (i32, table<i64>) {
+    var req = analyze_request(src, base, vpath, stages)
+    var inf = ".tsp_wire_in.tmp"
+    var outf = ".tsp_wire_out.tmp"
+    var errf = ".tsp_wire_err.tmp"
+    byte_write(inf, req)
+    var cmd = "\"" + abs_exe(exe) + "\" --tink-serve < " + inf + " > " + outf + " 2> " + errf
+    var rc: i32 = 0
+    unsafe {
+        rc = exec_code(cmd)
+    }
+    var resp = byte_read(outf)
+    file_delete(inf)
+    file_delete(outf)
+    file_delete(errf)
+    return (rc, resp)
+}
+
+}   // namespace tsp_wire

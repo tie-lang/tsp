@@ -273,7 +273,7 @@ pub func references(uri: string, txt: string, base_dir: string, line: i64, chara
         var dtext = an.fetch_text(du)
         if len(dtext) > 0 {
             var ok = an.run_check(dtext, uri_to_dir(du))
-            if ok == 1 {
+            if ok == 1 && len(g_file_roots) > 0 {
                 walk_refs(g_file_roots[0], name, du, locs, ruris, rls, rcs)
             }
         }

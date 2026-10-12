@@ -3,24 +3,23 @@ type tie<logic>
 // format.tie：tsp（tie Language Server）——document formatting（p.6.9.11）
 // 命名空间：tsp_fmt
 //
-// 纯文本格式化（不依赖编译器前端，独立模块）：
-//   · 2 空格缩进：按 {} 深度增减（{ 增、} 减后再缩进该行；} 单独成行时
-//     缩进为其外一层）
+// 纯文本格式化（**词法安全**：内部字符串/注释扫描器，不依赖编译器前端）：
+//   · 2 空格缩进：按代码区 {} 深度增减（{ 增、} 减后再缩进该行；} 单独成行
+//     时缩进为其外一层）
 //   · 保留空行（连续空行压到最多 1 行）
-//   · 行尾空白去除；文件末尾补一个换行（已有时不重复）
+//   · 行尾空白去除（仅代码行；字符串/注释内部行**一字节不改**）
+//   · 文件末尾补一个换行（已有时不重复）
 //   · 不做运算符空格规范化——只做缩进/空行/行尾
-//   · 字符串字面量与 // 注释内容不处理：缩进判定时跳过位于 " 字符串内
-//     或 // 注释后的 { }（不必做字符串内部改写）
 //
-// 返回 LSP TextEdit[] JSON（整文档替换）：
-//   [{"range":{"start":{"line":0,"character":0},
-//     "end":{"line":<末行>,"character":<末行长度>}},
-//     "newText":<json_str 格式化文本>}]
-// 文本为空或格式化结果与原文一致 → "[]"。
-// 幂等：对输出再格式化输出不变（已定型 → 返回 []）。
+// 词法安全扫描器（跨行状态机；规范 §1.4/§1.9 全形态）：
+//   "…"（转义生效）· r"…"（原始，无转义）· """…"""（多行）· h"…" / h"""…"""
+//   （插值——本层整体视为字符串，花括号不改写）· // 与 ///（行注释）·
+//   /* */（块注释，跨行）。花括号计数仅统计**代码区**；字符串/注释内部
+//   的行（含多行字符串的中间行）保持原样。
+//   （旧版只跳 " 与 //，多行字符串/块注释内的花括号会破坏缩进——已修。）
 //
-// 逐行处理：每行先算缩进深度（上一行未闭合 { 数 − 本行前导 } 数）产出新行；
-// 用表收集行、最后 join（StringBuilder 原地追加，避免 O(n²) 拼接）。
+// 返回 LSP TextEdit[] JSON（整文档替换）；空文本或格式化结果与原文一致 →
+// "[]"；幂等（对输出再格式化输出不变）。
 //
 // 本文件编译：随 server.tie 一起编译（server 主入口 import 本文件）或经
 // probe_format.tie 单独编译验证（仅依赖 protocol.tie，无前端依赖）。
@@ -39,77 +38,35 @@ func line_start(txt: string, line: i64) -> i64 {
             off = off + 1
         }
         if off < len(txt) {
-            off = off + 1  // 跳过 \n
+            off = off + 1
         }
         ln = ln + 1
     }
     return off
 }
 
-// 按 \n 切行（\r 丢弃；保留末尾 \n 产生的末空段——供末尾空行识别）。
+// 按 \n 拆行（不含行尾换行符）。
 func split_lines(s: string) -> table<string> {
     var out = table_new_string()
-    var cur: string = ""
+    var n = len(s)
     var i: i64 = 0
-    while i < len(s) {
-        var c = str_char(s, i)
-        if c == "\n" {
-            table_push(out, cur)
-            cur = ""
-        } else if c != "\r" {
-            cur = cur + c
+    var start: i64 = 0
+    while i < n {
+        if str_byte(s, i) == 10 {
+            table_push(out, proto.substr_at(s, start, i))
+            start = i + 1
         }
         i = i + 1
     }
-    table_push(out, cur)
+    table_push(out, proto.substr_at(s, start, n))
     return out
 }
 
-// 单字符是否空白（空格/制表）。
 func is_ws(c: string) -> bool {
-    return c == " " || c == "\t"
+    return c == " " || c == "\t" || c == "\r"
 }
 
-// 前导 } 计数（content 已去首尾空白；首字符非 } 则 0）。
-func leading_close(content: string) -> i64 {
-    var n: i64 = 0
-    var i: i64 = 0
-    while i < len(content) && str_char(content, i) == "}" {
-        n = n + 1
-        i = i + 1
-    }
-    return n
-}
-
-// 统计不在字符串字面量（含 \ 转义跳过）与 // 注释内的 { } 数量。
-func count_braces(s: string) -> (i64, i64) {
-    var opens: i64 = 0
-    var closes: i64 = 0
-    var in_str: bool = false
-    var i: i64 = 0
-    while i < len(s) {
-        var c = str_char(s, i)
-        if in_str {
-            if c == "\\" {
-                i = i + 1  // 跳过转义字符（含 \" 与 \\）
-            } else if c == "\"" {
-                in_str = false
-            }
-        } else if c == "\"" {
-            in_str = true
-        } else if c == "/" && i + 1 < len(s) && str_char(s, i + 1) == "/" {
-            break  // // 注释：本行余下部分不参与
-        } else if c == "{" {
-            opens = opens + 1
-        } else if c == "}" {
-            closes = closes + 1
-        }
-        i = i + 1
-    }
-    return (opens, closes)
-}
-
-// 缩进串：n 层 = 2n 空格。
+// 2 空格缩进串。
 func indent_str(n: i64) -> string {
     var sb = string_builder()
     var i: i64 = 0
@@ -120,26 +77,126 @@ func indent_str(n: i64) -> string {
     return sb_build(sb)
 }
 
-// 表 join（StringBuilder 原地追加，O(total)，避免 O(n²) 拼接）；
-// 末尾空段跳过（保证结果恰以一个换行收尾，即末尾空行去除）。
-func join_lines(items: table<string>, sep: string) -> string {
-    var n = len(items)
-    while n > 0 && len(items[n - 1]) == 0 {
-        n = n - 1
-    }
-    if n == 0 {
-        return ""
-    }
-    var sb = string_builder()
+// 首个非空白字符为 }（代码区；用于 } 行缩进出层）。
+func leading_close(content: string) -> i64 {
     var i: i64 = 0
-    while i < n {
-        if i > 0 {
-            sb_append(sb, sep)
-        }
-        sb_append(sb, items[i])
+    while i < len(content) && is_ws(str_char(content, i)) {
         i = i + 1
     }
-    return sb_build(sb)
+    if i < len(content) && str_char(content, i) == "}" {
+        return 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// 词法安全扫描：状态机（跨行）
+//   st：0=代码 1="…" 2=r"…" 3="""…""" 4=/* */
+// 返回 (行内代码区 open 数, close 数, 行末状态)。
+// ---------------------------------------------------------------------------
+func scan_code(ln: string, st0: i64) -> (i64, i64, i64) {
+    var n = len(ln)
+    var i: i64 = 0
+    var st = st0
+    var open: i64 = 0
+    var close: i64 = 0
+    while i < n {
+        var b = str_byte(ln, i)
+        if st == 0 {
+            // 代码区：先看注释/字符串起始
+            if b == 47 && i + 1 < n && str_byte(ln, i + 1) == 47 {
+                break   // // 与 ///：行注释，余下不计
+            }
+            if b == 47 && i + 1 < n && str_byte(ln, i + 1) == 42 {
+                st = 4
+                i = i + 2
+                continue
+            }
+            if b == 114 && i + 1 < n && str_byte(ln, i + 1) == 34 {
+                st = 2
+                i = i + 2
+                continue
+            }
+            if b == 104 && i + 1 < n && str_byte(ln, i + 1) == 34 {
+                // h""" 或 h"
+                if i + 3 < n && str_byte(ln, i + 2) == 34 && str_byte(ln, i + 3) == 34 {
+                    st = 3
+                    i = i + 4
+                    continue
+                }
+                st = 1
+                i = i + 2
+                continue
+            }
+            if b == 34 {
+                if i + 2 < n && str_byte(ln, i + 1) == 34 && str_byte(ln, i + 2) == 34 {
+                    st = 3
+                    i = i + 3
+                    continue
+                }
+                st = 1
+                i = i + 1
+                continue
+            }
+            if b == 123 {
+                open = open + 1
+            } else if b == 125 {
+                close = close + 1
+            }
+            i = i + 1
+        } else if st == 1 {
+            // "…"：反斜杠转义跳两字节
+            if b == 92 {
+                i = i + 2
+                continue
+            }
+            if b == 34 {
+                st = 0
+            }
+            i = i + 1
+        } else if st == 2 {
+            // r"…"：无转义
+            if b == 34 {
+                st = 0
+            }
+            i = i + 1
+        } else if st == 3 {
+            // """…"""：三引号闭合
+            if b == 34 && i + 2 < n && str_byte(ln, i + 1) == 34 && str_byte(ln, i + 2) == 34 {
+                st = 0
+                i = i + 3
+                continue
+            }
+            i = i + 1
+        } else {
+            // 块注释：找 */
+            if b == 42 && i + 1 < n && str_byte(ln, i + 1) == 47 {
+                st = 0
+                i = i + 2
+                continue
+            }
+            i = i + 1
+        }
+    }
+    return (open, close, st)
+}
+
+// 行尾空白去除（仅代码行调用）。
+func trim_end(raw: string) -> string {
+    var e = len(raw)
+    while e > 0 && is_ws(str_char(raw, e - 1)) {
+        e = e - 1
+    }
+    return proto.substr_at(raw, 0, e)
+}
+
+// 行首空白去除。
+func trim_head(s: string) -> string {
+    var b: i64 = 0
+    while b < len(s) && is_ws(str_char(s, b)) {
+        b = b + 1
+    }
+    return proto.substr_at(s, b, len(s))
 }
 
 // 文本中 \n 数量（= 0 基末行号）。
@@ -171,43 +228,45 @@ pub func format(uri: string, txt: string) -> string {
     var out = table_new_string()
     var depth: i64 = 0
     var prev_blank: bool = false
+    var st: i64 = 0
     var i: i64 = 0
     while i < len(lines) {
         var raw = lines[i]
-        // 行尾空白去除
-        var e = len(raw)
-        while e > 0 && is_ws(str_char(raw, e - 1)) {
-            e = e - 1
+        // 行首处于字符串/注释内部（含多行字符串中间行）→ 整行原样保留
+        if st != 0 {
+            table_push(out, raw)
+            prev_blank = false
+            var r2 = scan_code(raw, st)
+            st = r2.2
+            i = i + 1
+            continue
         }
-        var s2 = proto.substr_at(raw, 0, e)
-        // 行首空白去除（缩进由本模块重算）
-        var b: i64 = 0
-        while b < len(s2) && is_ws(str_char(s2, b)) {
-            b = b + 1
-        }
-        var content = proto.substr_at(s2, b, len(s2))
+        var s2 = trim_end(raw)
+        var content = trim_head(s2)
         if len(content) == 0 {
             // 空行：连续空行压到最多 1 行（保留首空行，后续连续空行跳过）
             if !prev_blank {
                 table_push(out, "")
                 prev_blank = true
             }
-        } else {
-            // 缩进深度 = 上一行未闭合 { 数 − 本行前导 } 数（不越 0）
-            var lc = leading_close(content)
-            var lvl = depth - lc
-            if lvl < 0 {
-                lvl = 0
-            }
-            table_push(out, indent_str(lvl) + content)
-            prev_blank = false
+            i = i + 1
+            continue
         }
-        // 深度更新：本行未闭合 { 数（字符串/注释内不计）
-        var (opens, closes) = count_braces(content)
-        depth = depth + opens - closes
+        // 缩进深度 = 上一行未闭合 { 数 − 本行前导 } 数（不越 0）
+        var lc = leading_close(content)
+        var lvl = depth - lc
+        if lvl < 0 {
+            lvl = 0
+        }
+        table_push(out, indent_str(lvl) + content)
+        prev_blank = false
+        // 深度与状态更新（词法安全：字符串/注释内不计花括号）
+        var sc = scan_code(content, st)
+        depth = depth + sc.0 - sc.1
         if depth < 0 {
             depth = 0
         }
+        st = sc.2
         i = i + 1
     }
     var result = join_lines(out, "\n") + "\n"
@@ -218,6 +277,27 @@ pub func format(uri: string, txt: string) -> string {
         to_string(count_nl(txt)) + ",\"character\":" + to_string(last_line_len(txt)) +
         "}},\"newText\":" + proto.json_str(result) + "}]"
     return body
+}
+
+// 行数组 → 拼接（去尾零长度行；sep 连接；StringBuilder 原地追加）。
+func join_lines(items: table<string>, sep: string) -> string {
+    var n = len(items)
+    while n > 0 && len(items[n - 1]) == 0 {
+        n = n - 1
+    }
+    if n == 0 {
+        return ""
+    }
+    var sb = string_builder()
+    var i: i64 = 0
+    while i < n {
+        if i > 0 {
+            sb_append(sb, sep)
+        }
+        sb_append(sb, items[i])
+        i = i + 1
+    }
+    return sb_build(sb)
 }
 
 }   // namespace tsp_fmt

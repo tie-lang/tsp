@@ -1,0 +1,294 @@
+type tie<logic>
+// tsp_ast.tie —— tsp 自持 AST 数据模型（结构化包的装载目标；零前端引用）
+// ============================================================================
+// namespace：tsp_ast（另提供同名兼容 ns `intern`）
+//
+// 设计（tsp 包化改造方案 §4.2）：
+//   · 列容器与结构化包 ast 阶段列（字段号 100-109）一一对应；tsp_pkt 反向填写；
+//   · **表名与旧前端同名**（s_tags/s_names/...）且提供同名 `intern.lookup` ⇒
+//     nav/tokens/refactor 的既有引用零改动，只有「符号来源」由 frontend import
+//     换成本文件；
+//   · s_names 存**池 id**（装载时对文本列重新 intern，与旧语义一致）；
+//   · s_vals/s_aux/s_coff/s_nchild/s_children/s_lines/s_cols/s_file_ids 为 i64
+//     原值列（无 intern 环节）。
+//
+// 信封辅助：
+//   g_pool（字符串池，id=下标；装载自建）· g_files（文件表，0=主输入）
+//   · g_main_root（主文件根节点 id）· g_file_roots（兼容旧式 [root] 取值）
+//
+// symtab / xref（tsp_pkt 装载；供符号索引与跨文件导航；结构与列名见 tsp_pkt）：
+//   sym_* 平行列（函数/签名/参数段/struct/字段/enum/alias/全局表）
+//   xref_* 平行列（scope/声明/使用）
+// 诊断投影（tsp_pkt 装载 diag 记录；analyze 消费）：
+//   g_dg_codes/g_dg_sev/g_dg_line/g_dg_col/g_dg_el/g_dg_ec/g_dg_rendered/
+//   g_dg_file_ids（平行列，逐文档整体覆盖）
+
+// ==================== ast 列容器（表名沿用旧前端） ====================
+var s_tags: table<i64>;
+var s_names: table<i64>;
+var s_vals: table<i64>;
+var s_aux: table<i64>;
+var s_coff: table<i64>;
+var s_nchild: table<i64>;
+var s_children: table<i64>;
+var s_lines: table<i64>;
+var s_cols: table<i64>;
+var s_file_ids: table<i64>;
+
+// ==================== 信封辅助 ====================
+var g_pool: table<string>;
+var g_pool_map_k: table<string>;   // intern 反向映射（池规模小，线性查找足够）
+var g_pool_map_v: table<i64>;
+var g_files: table<string>;
+var g_main_root: i64 = -1;
+var g_file_roots: table<i64>;      // 兼容旧用法 g_file_roots[0] = 主文件根
+
+// ==================== 诊断投影（diag 记录 → 平行列） ====================
+var g_dg_codes: table<string>;
+var g_dg_sev: table<i64>;          // 0=E 1=W
+var g_dg_line: table<i64>;
+var g_dg_col: table<i64>;
+var g_dg_el: table<i64>;
+var g_dg_ec: table<i64>;
+var g_dg_rendered: table<string>;  // 211 列（渲染文本；LSP message 直接取用）
+var g_dg_file_ids: table<i64>;
+
+// ==================== 词法 tokens（tokens 记录 → 平行列） ====================
+var tk_kinds: table<i64>;
+var tk_text: table<string>;
+var tk_lines: table<i64>;
+var tk_cols: table<i64>;
+
+// ==================== 符号表 / 交叉引用（symtab 记录 → 平行列） ====================
+// 全局/外部/返回表
+var sym_gb_names: table<string>;
+var sym_gb_tys: table<i64>;
+var sym_gb_const: table<i64>;
+var sym_gb_telem: table<i64>;
+var sym_ext_names: table<string>;
+var sym_tre_names: table<string>;
+var sym_tre_vals: table<i64>;
+// 函数族
+var sym_fn_names: table<string>;
+var sym_fn_sig_ids: table<i64>;
+var sym_fn_def_nodes: table<i64>;
+var sym_fn_mods: table<i64>;
+var sym_sg_nparams: table<i64>;
+var sym_sg_required: table<i64>;
+var sym_sg_ret: table<i64>;
+var sym_sg_pub: table<i64>;
+var sym_sg_off: table<i64>;
+var sym_sg_gen: table<i64>;
+var sym_sp_tys: table<i64>;
+var sym_sp_refs: table<i64>;
+var sym_sp_defs: table<i64>;
+var sym_sp_vars: table<i64>;
+// struct / 字段
+var sym_st_names: table<string>;
+var sym_st_parent: table<i64>;
+var sym_st_fldoff: table<i64>;
+var sym_st_nfld: table<i64>;
+var sym_st_reprc: table<i64>;
+var sym_fld_names: table<string>;
+var sym_fld_tys: table<i64>;
+var sym_fld_defs: table<i64>;
+// enum
+var sym_en_names: table<string>;
+var sym_en_nvar: table<i64>;
+var sym_en_varoff: table<i64>;
+var sym_en_nslot: table<i64>;
+var sym_en_vnames: table<string>;
+var sym_en_vtags: table<i64>;
+var sym_en_vfldoff: table<i64>;
+var sym_en_vnfld: table<i64>;
+var sym_en_ftys: table<i64>;
+// alias
+var sym_alias_names: table<string>;
+var sym_alias_nodes: table<i64>;
+// xref
+var xref_scope_parent: table<i64>;
+var xref_scope_owner: table<i64>;
+var xref_decl_names: table<string>;
+var xref_decl_kinds: table<i64>;
+var xref_decl_tys: table<i64>;
+var xref_decl_scopes: table<i64>;
+var xref_decl_nodes: table<i64>;
+var xref_decl_lines: table<i64>;
+var xref_decl_cols: table<i64>;
+var xref_use_nodes: table<i64>;
+var xref_use_decls: table<i64>;
+
+// ---------- 就地清空工具（顶层；跨 ns 可见） ----------
+// 防「表类型全局重赋值不释放旧值」的泄漏：长驻服务每请求复位装载目标，
+// 一律「就地弹出清空 + 复用」而非「新表重赋值」。首次运行时表为空（安全）。
+// 名字带 tsp_ 前缀保全编译单元唯一。
+func tsp_clear_i64(t: ref table<i64>) {
+    while len(t) > 0 {
+        table_pop(t)
+    }
+}
+
+func tsp_clear_str(t: ref table<string>) {
+    while len(t) > 0 {
+        table_pop(t)
+    }
+}
+
+namespace intern {
+
+// 复位池（每次装载 AST 前调用；就地清空，复用不泄漏）。
+pub func reset() {
+    tsp_clear_str(g_pool)
+    tsp_clear_str(g_pool_map_k)
+    tsp_clear_i64(g_pool_map_v)
+}
+
+// 文本 → id（不存在则登记）。装载器对每个文本列元素调用（与旧 intern 语义一致）。
+pub func intern(s: string) -> i64 {
+    var i: i64 = 0
+    while i < len(g_pool_map_k) {
+        if g_pool_map_k[i] == s {
+            return g_pool_map_v[i]
+        }
+        i = i + 1
+    }
+    var id = len(g_pool)
+    table_push(g_pool, s)
+    table_push(g_pool_map_k, s)
+    table_push(g_pool_map_v, id)
+    return id
+}
+
+// id → 文本（旧调用点 `intern.lookup(...)` 的兼容面）。
+pub func lookup(id: i64) -> string {
+    if id >= 0 && id < len(g_pool) {
+        return g_pool[id]
+    }
+    return ""
+}
+
+// 池长度（探针用）。
+pub func len_of() -> i64 {
+    return len(g_pool)
+}
+
+}   // namespace intern
+
+namespace tsp_ast {
+
+// 复位全部容器（每次装载前调用；不含 LRU 等上层状态）。
+pub func reset() {
+    tsp_clear_i64(s_tags)
+    tsp_clear_i64(s_names)
+    tsp_clear_i64(s_vals)
+    tsp_clear_i64(s_aux)
+    tsp_clear_i64(s_coff)
+    tsp_clear_i64(s_nchild)
+    tsp_clear_i64(s_children)
+    tsp_clear_i64(s_lines)
+    tsp_clear_i64(s_cols)
+    tsp_clear_i64(s_file_ids)
+    tsp_clear_str(g_files)
+    g_main_root = -1
+    tsp_clear_i64(g_file_roots)
+    intern.reset()
+}
+
+// 复位诊断投影（diag 装载前调用）。
+pub func reset_diag() {
+    tsp_clear_str(g_dg_codes)
+    tsp_clear_i64(g_dg_sev)
+    tsp_clear_i64(g_dg_line)
+    tsp_clear_i64(g_dg_col)
+    tsp_clear_i64(g_dg_el)
+    tsp_clear_i64(g_dg_ec)
+    tsp_clear_str(g_dg_rendered)
+    tsp_clear_i64(g_dg_file_ids)
+}
+
+// 复位词法 tokens（tokens 装载前调用）。
+pub func reset_tokens() {
+    tsp_clear_i64(tk_kinds)
+    tsp_clear_str(tk_text)
+    tsp_clear_i64(tk_lines)
+    tsp_clear_i64(tk_cols)
+}
+
+// 复位符号表 / xref（symtab 装载前调用）。
+pub func reset_sym() {
+    tsp_clear_str(sym_gb_names)
+    tsp_clear_i64(sym_gb_tys)
+    tsp_clear_i64(sym_gb_const)
+    tsp_clear_i64(sym_gb_telem)
+    tsp_clear_str(sym_ext_names)
+    tsp_clear_str(sym_tre_names)
+    tsp_clear_i64(sym_tre_vals)
+    tsp_clear_str(sym_fn_names)
+    tsp_clear_i64(sym_fn_sig_ids)
+    tsp_clear_i64(sym_fn_def_nodes)
+    tsp_clear_i64(sym_fn_mods)
+    tsp_clear_i64(sym_sg_nparams)
+    tsp_clear_i64(sym_sg_required)
+    tsp_clear_i64(sym_sg_ret)
+    tsp_clear_i64(sym_sg_pub)
+    tsp_clear_i64(sym_sg_off)
+    tsp_clear_i64(sym_sg_gen)
+    tsp_clear_i64(sym_sp_tys)
+    tsp_clear_i64(sym_sp_refs)
+    tsp_clear_i64(sym_sp_defs)
+    tsp_clear_i64(sym_sp_vars)
+    tsp_clear_str(sym_st_names)
+    tsp_clear_i64(sym_st_parent)
+    tsp_clear_i64(sym_st_fldoff)
+    tsp_clear_i64(sym_st_nfld)
+    tsp_clear_i64(sym_st_reprc)
+    tsp_clear_str(sym_fld_names)
+    tsp_clear_i64(sym_fld_tys)
+    tsp_clear_i64(sym_fld_defs)
+    tsp_clear_str(sym_en_names)
+    tsp_clear_i64(sym_en_nvar)
+    tsp_clear_i64(sym_en_varoff)
+    tsp_clear_i64(sym_en_nslot)
+    tsp_clear_str(sym_en_vnames)
+    tsp_clear_i64(sym_en_vtags)
+    tsp_clear_i64(sym_en_vfldoff)
+    tsp_clear_i64(sym_en_vnfld)
+    tsp_clear_i64(sym_en_ftys)
+    tsp_clear_str(sym_alias_names)
+    tsp_clear_i64(sym_alias_nodes)
+    tsp_clear_i64(xref_scope_parent)
+    tsp_clear_i64(xref_scope_owner)
+    tsp_clear_str(xref_decl_names)
+    tsp_clear_i64(xref_decl_kinds)
+    tsp_clear_i64(xref_decl_tys)
+    tsp_clear_i64(xref_decl_scopes)
+    tsp_clear_i64(xref_decl_nodes)
+    tsp_clear_i64(xref_decl_lines)
+    tsp_clear_i64(xref_decl_cols)
+    tsp_clear_i64(xref_use_nodes)
+    tsp_clear_i64(xref_use_decls)
+}
+
+// ---------- 遍历便捷（旧代码若直读表则不依赖；供新代码与探针用） ----------
+
+pub func nchild(node: i64) -> i64 {
+    return s_nchild[node]
+}
+
+pub func child(node: i64, k: i64) -> i64 {
+    return s_children[s_coff[node] + k]
+}
+
+pub func name_of(node: i64) -> string {
+    return intern.lookup(s_names[node])
+}
+
+pub func line_of(node: i64) -> i64 {
+    return s_lines[node]
+}
+
+pub func col_of(node: i64) -> i64 {
+    return s_cols[node]
+}
+
+}   // namespace tsp_ast
