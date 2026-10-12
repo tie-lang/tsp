@@ -118,17 +118,17 @@ var xref_decl_cols: table<i64>;
 var xref_use_nodes: table<i64>;
 var xref_use_decls: table<i64>;
 
-// ---------- 就地清空工具（顶层；跨 ns 可见） ----------
+// ---------- 就地清空工具（顶层；pub：供 tsp_pkt 等装载方跨文件使用） ----------
 // 防「表类型全局重赋值不释放旧值」的泄漏：长驻服务每请求复位装载目标，
 // 一律「就地弹出清空 + 复用」而非「新表重赋值」。首次运行时表为空（安全）。
 // 名字带 tsp_ 前缀保全编译单元唯一。
-func tsp_clear_i64(t: ref table<i64>) {
+pub func tsp_clear_i64(t: ref table<i64>) {
     while len(t) > 0 {
         table_pop(t)
     }
 }
 
-func tsp_clear_str(t: ref table<string>) {
+pub func tsp_clear_str(t: ref table<string>) {
     while len(t) > 0 {
         table_pop(t)
     }
