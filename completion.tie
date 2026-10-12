@@ -25,8 +25,10 @@ import "./protocol.tie" as proto
 
 // ---- 顶层常量（namespace 体内禁止 var/const，放文件顶层）----
 
-// 关键字列表（可扩展）：普通模式候选 kind=14。
-var g_kw_s: string = "if else while for return import using namespace func struct enum var const pub unsafe type switch case break continue table map true false in as extern impl port actor async try panic println print len str_char char_code str_len to_string table_push table_new table_new_i64 table_new_string exit time_now time_now_ms read_line str_find str_contains string_builder sb_append sb_build"
+// 关键字列表：对照规范 §1.6 全表（封闭集合，与编译器扫描器一致）；
+// 按用途分组：声明 / 类型 / 语句 / 修饰与更新 / 表达式 / 字面量 / 并发 / 汇编；
+// 末尾 type、try 为 §1.13 上下文关键字（沿用保留，便于补全）。普通模式候选 kind=14。
+var g_kw_s: string = "var const func struct enum namespace port interface impl import as pub using extern macro alias actor extends i8 i16 i32 i64 u8 u16 u32 u64 i128 u128 f32 f64 bool trit char string void code table map num text misc any if else while for in switch case default when break continue return yield goto ref immut move deep shared inline repr unsafe async with reentrant is await true false zero panic asm type try"
 
 // 常用内置函数名（无前缀过滤时作为补全内容）：候选 kind=3。
 var g_builtin_s: string = "println print len str_char char_code str_len to_string str_find str_contains str_sub_bytes str_byte str_from_code table_push table_new table_new_i64 table_new_string exit panic read_line time_now time_now_ms file_read file_exists file_write get_env exec_code string_builder sb_append sb_build"
