@@ -123,7 +123,7 @@ func bytes_to_str(b: table<i64>) -> string {
     return sb_build(sb)
 }
 
-func split_lines(s: string) -> table<string> {
+pub func split_lines(s: string) -> table<string> {
     var out = table_new_string()
     var cur: string = ""
     var i: i64 = 0

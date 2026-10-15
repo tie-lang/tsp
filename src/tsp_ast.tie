@@ -24,99 +24,99 @@ type tie<logic>
 //   g_dg_file_ids（平行列，逐文档整体覆盖）
 
 // ==================== ast 列容器（表名沿用旧前端） ====================
-var s_tags: table<i64>;
-var s_names: table<i64>;
-var s_vals: table<i64>;
-var s_aux: table<i64>;
-var s_coff: table<i64>;
-var s_nchild: table<i64>;
-var s_children: table<i64>;
-var s_lines: table<i64>;
-var s_cols: table<i64>;
-var s_file_ids: table<i64>;
+pub var s_tags: table<i64>;
+pub var s_names: table<i64>;
+pub var s_vals: table<i64>;
+pub var s_aux: table<i64>;
+pub var s_coff: table<i64>;
+pub var s_nchild: table<i64>;
+pub var s_children: table<i64>;
+pub var s_lines: table<i64>;
+pub var s_cols: table<i64>;
+pub var s_file_ids: table<i64>;
 
 // ==================== 信封辅助 ====================
 var g_pool: table<string>;
 var g_pool_map_k: table<string>;   // intern 反向映射（池规模小，线性查找足够）
 var g_pool_map_v: table<i64>;
-var g_files: table<string>;
-var g_main_root: i64 = -1;
-var g_file_roots: table<i64>;      // 兼容旧用法 g_file_roots[0] = 主文件根
+pub var g_files: table<string>;
+pub var g_main_root: i64 = -1;
+pub var g_file_roots: table<i64>;      // 兼容旧用法 g_file_roots[0] = 主文件根
 
 // ==================== 诊断投影（diag 记录 → 平行列） ====================
-var g_dg_codes: table<string>;
-var g_dg_sev: table<i64>;          // 0=E 1=W
-var g_dg_line: table<i64>;
-var g_dg_col: table<i64>;
-var g_dg_el: table<i64>;
-var g_dg_ec: table<i64>;
-var g_dg_rendered: table<string>;  // 211 列（渲染文本；LSP message 直接取用）
-var g_dg_file_ids: table<i64>;
+pub var g_dg_codes: table<string>;
+pub var g_dg_sev: table<i64>;          // 0=E 1=W
+pub var g_dg_line: table<i64>;
+pub var g_dg_col: table<i64>;
+pub var g_dg_el: table<i64>;
+pub var g_dg_ec: table<i64>;
+pub var g_dg_rendered: table<string>;  // 211 列（渲染文本；LSP message 直接取用）
+pub var g_dg_file_ids: table<i64>;
 
 // ==================== 词法 tokens（tokens 记录 → 平行列） ====================
-var tk_kinds: table<i64>;
-var tk_text: table<string>;
-var tk_lines: table<i64>;
-var tk_cols: table<i64>;
+pub var tk_kinds: table<i64>;
+pub var tk_text: table<string>;
+pub var tk_lines: table<i64>;
+pub var tk_cols: table<i64>;
 
 // ==================== 符号表 / 交叉引用（symtab 记录 → 平行列） ====================
 // 全局/外部/返回表
-var sym_gb_names: table<string>;
-var sym_gb_tys: table<i64>;
-var sym_gb_const: table<i64>;
-var sym_gb_telem: table<i64>;
-var sym_ext_names: table<string>;
-var sym_tre_names: table<string>;
-var sym_tre_vals: table<i64>;
+pub var sym_gb_names: table<string>;
+pub var sym_gb_tys: table<i64>;
+pub var sym_gb_const: table<i64>;
+pub var sym_gb_telem: table<i64>;
+pub var sym_ext_names: table<string>;
+pub var sym_tre_names: table<string>;
+pub var sym_tre_vals: table<i64>;
 // 函数族
-var sym_fn_names: table<string>;
-var sym_fn_sig_ids: table<i64>;
-var sym_fn_def_nodes: table<i64>;
-var sym_fn_mods: table<i64>;
-var sym_sg_nparams: table<i64>;
-var sym_sg_required: table<i64>;
-var sym_sg_ret: table<i64>;
-var sym_sg_pub: table<i64>;
-var sym_sg_off: table<i64>;
-var sym_sg_gen: table<i64>;
-var sym_sp_tys: table<i64>;
-var sym_sp_refs: table<i64>;
-var sym_sp_defs: table<i64>;
-var sym_sp_vars: table<i64>;
+pub var sym_fn_names: table<string>;
+pub var sym_fn_sig_ids: table<i64>;
+pub var sym_fn_def_nodes: table<i64>;
+pub var sym_fn_mods: table<i64>;
+pub var sym_sg_nparams: table<i64>;
+pub var sym_sg_required: table<i64>;
+pub var sym_sg_ret: table<i64>;
+pub var sym_sg_pub: table<i64>;
+pub var sym_sg_off: table<i64>;
+pub var sym_sg_gen: table<i64>;
+pub var sym_sp_tys: table<i64>;
+pub var sym_sp_refs: table<i64>;
+pub var sym_sp_defs: table<i64>;
+pub var sym_sp_vars: table<i64>;
 // struct / 字段
-var sym_st_names: table<string>;
-var sym_st_parent: table<i64>;
-var sym_st_fldoff: table<i64>;
-var sym_st_nfld: table<i64>;
-var sym_st_reprc: table<i64>;
-var sym_fld_names: table<string>;
-var sym_fld_tys: table<i64>;
-var sym_fld_defs: table<i64>;
+pub var sym_st_names: table<string>;
+pub var sym_st_parent: table<i64>;
+pub var sym_st_fldoff: table<i64>;
+pub var sym_st_nfld: table<i64>;
+pub var sym_st_reprc: table<i64>;
+pub var sym_fld_names: table<string>;
+pub var sym_fld_tys: table<i64>;
+pub var sym_fld_defs: table<i64>;
 // enum
-var sym_en_names: table<string>;
-var sym_en_nvar: table<i64>;
-var sym_en_varoff: table<i64>;
-var sym_en_nslot: table<i64>;
-var sym_en_vnames: table<string>;
-var sym_en_vtags: table<i64>;
-var sym_en_vfldoff: table<i64>;
-var sym_en_vnfld: table<i64>;
-var sym_en_ftys: table<i64>;
+pub var sym_en_names: table<string>;
+pub var sym_en_nvar: table<i64>;
+pub var sym_en_varoff: table<i64>;
+pub var sym_en_nslot: table<i64>;
+pub var sym_en_vnames: table<string>;
+pub var sym_en_vtags: table<i64>;
+pub var sym_en_vfldoff: table<i64>;
+pub var sym_en_vnfld: table<i64>;
+pub var sym_en_ftys: table<i64>;
 // alias
-var sym_alias_names: table<string>;
-var sym_alias_nodes: table<i64>;
+pub var sym_alias_names: table<string>;
+pub var sym_alias_nodes: table<i64>;
 // xref
-var xref_scope_parent: table<i64>;
-var xref_scope_owner: table<i64>;
-var xref_decl_names: table<string>;
-var xref_decl_kinds: table<i64>;
-var xref_decl_tys: table<i64>;
-var xref_decl_scopes: table<i64>;
-var xref_decl_nodes: table<i64>;
-var xref_decl_lines: table<i64>;
-var xref_decl_cols: table<i64>;
-var xref_use_nodes: table<i64>;
-var xref_use_decls: table<i64>;
+pub var xref_scope_parent: table<i64>;
+pub var xref_scope_owner: table<i64>;
+pub var xref_decl_names: table<string>;
+pub var xref_decl_kinds: table<i64>;
+pub var xref_decl_tys: table<i64>;
+pub var xref_decl_scopes: table<i64>;
+pub var xref_decl_nodes: table<i64>;
+pub var xref_decl_lines: table<i64>;
+pub var xref_decl_cols: table<i64>;
+pub var xref_use_nodes: table<i64>;
+pub var xref_use_decls: table<i64>;
 
 // ---------- 就地清空工具（顶层；pub：供 tsp_pkt 等装载方跨文件使用） ----------
 // 防「表类型全局重赋值不释放旧值」的泄漏：长驻服务每请求复位装载目标，

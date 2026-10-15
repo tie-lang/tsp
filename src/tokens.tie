@@ -95,7 +95,7 @@ namespace tsp_tok {
 // ==================== 自足小工具 ====================
 
 // 0 基行 → 行首字节偏移（越界返回 len(txt)）。字节级（str_char ~360µs/次）。
-func line_start(txt: string, line: i64) -> i64 {
+pub func line_start(txt: string, line: i64) -> i64 {
     var off: i64 = 0
     var ln: i64 = 0
     while ln < line && off < len(txt) {
@@ -133,7 +133,7 @@ func off_col(txt: string, off: i64) -> i64 {
 }
 
 // 子串 [start, end)（越界钳位；str_sub_bytes 一次拷贝）。
-func substr(s: string, start: i64, end: i64) -> string {
+pub func substr(s: string, start: i64, end: i64) -> string {
     var a = start
     var b = end
     if a < 0 {

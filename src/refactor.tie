@@ -31,7 +31,7 @@ namespace tsp_ref {
 // ==================== 自足小工具 ====================
 
 // 行号（0-based）→ 行首偏移（越界返回文本长度）。
-func line_start(txt: string, line: i64) -> i64 {
+pub func line_start(txt: string, line: i64) -> i64 {
     var off: i64 = 0
     var ln: i64 = 0
     while ln < line && off < len(txt) {
@@ -47,13 +47,13 @@ func line_start(txt: string, line: i64) -> i64 {
 }
 
 // 单字符是否标识符延续字符（字母/数字/下划线；char_code 数值比较）。
-func is_idchar(c: string) -> bool {
+pub func is_idchar(c: string) -> bool {
     var v = char_code(c)
     return (v >= 65 && v <= 90) || (v >= 97 && v <= 122) || (v >= 48 && v <= 57) || v == 95
 }
 
 // 从 off 向两端扩展标识符；无标识符返回 ""。
-func ident_at(txt: string, off: i64) -> string {
+pub func ident_at(txt: string, off: i64) -> string {
     if off < 0 || off > len(txt) {
         return ""
     }
@@ -72,7 +72,7 @@ func ident_at(txt: string, off: i64) -> string {
 }
 
 // 位置（line/character 0-based）→ 文件偏移。
-func pos_to_offset(txt: string, line: i64, character: i64) -> i64 {
+pub func pos_to_offset(txt: string, line: i64, character: i64) -> i64 {
     var off = line_start(txt, line)
     var moved: i64 = 0
     while moved < character && off + moved < len(txt) && str_byte(txt, off + moved) != 10 {
@@ -149,7 +149,7 @@ func collect_refs(node: i64, name: string, uri: string, ref rs: table<i64>, ref 
 // ==================== rename（跨文件 WorkspaceEdit） ====================
 
 // uri → 文档所在目录（跨文件扫描用）。
-func uri_to_dir(uri: string) -> string {
+pub func uri_to_dir(uri: string) -> string {
     var p = uri
     if has_pfx(p, "file://") {
         p = proto.substr_at(p, len("file://"), len(p))
@@ -350,7 +350,7 @@ func extract_quoted(s: string) -> string {
 }
 
 // 首个子串出现位置（未找到 -1）。码点级遍历（消息含中文）。
-func str_find(hay: string, needle: string) -> i64 {
+pub func str_find(hay: string, needle: string) -> i64 {
     var h = str_len(hay)
     var n = str_len(needle)
     if n == 0 {

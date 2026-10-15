@@ -16,12 +16,12 @@ as the diagnostics engine, launched via `tie --lsp`.*
 tsp 由 tiec 编译（依赖 [tie-lang/tiec](https://github.com/tie-lang/tiec)）：
 
 ```bash
-tiec server.tie -o tsp.exe
+tiec src/server.tie -o target/tsp.exe
 ```
 
 ## 内容 / Contents
 
-- `server.tie` 服务主入口；`protocol.tie` LSP 协议层
+- `src/server.tie` 服务主入口；`protocol.tie` LSP 协议层
 - `analyze` / `completion` / `nav` / `refactor` / `sigdoc` / `format` / `tokens` 语义能力模块
 - `lsp_smoke*.py` 冒烟脚本与 `probe_*.tie` 探针（随源码仓分发）
 

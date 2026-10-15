@@ -31,7 +31,7 @@ if arg_count() >= 2 && !is_empty(arg_at(1)) {
 
 // cmd 对「含 .. 的引号路径」会报"文件名语法不正确"（实测）——先 cd 到本仓根
 // 再以相对路径调用；lib-root 用相对（编译进程 cwd 已固定在仓根）。
-var cmd = "cd /d \"" + root + "\" && \"" + tiec + "\" server.tie -o tsp.exe --no-warn --lib-root \"" + libroot + "\""
+var cmd = "cd /d \"" + root + "\" && \"" + tiec + "\" src/server.tie -o target/tsp.exe --no-warn --lib-root \"" + libroot + "\""
 println("命令: " + cmd)
 var rc = exec_code(cmd)
 if rc == 0 {

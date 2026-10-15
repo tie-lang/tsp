@@ -1333,7 +1333,7 @@ pub func stats_json() -> string {
 //     全文保留（编辑器的未保存缓冲不可丢：丢了就无法重算，而 LSP 没有其它来源）。
 //   · TSP_EVICT_TEXT=1：连同全文一并丢；下次访问由 ensure_text 从磁盘冷重建
 //     （⚠ 对未保存的缓冲是**有损**的，故默认关）。
-func evict_doc(uri: string) {
+pub func evict_doc(uri: string) {
     drop_doc(uri)
     if evict_text_on() == 1 {
         drop_text(uri)

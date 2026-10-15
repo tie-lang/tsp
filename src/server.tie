@@ -47,13 +47,13 @@ var g_dirty: table<string>
 
 // ---- 文档文本存取（委托 analyze 文本存储）----
 
-func set_doc(uri: string, txt: string) {
+pub func set_doc(uri: string, txt: string) {
     an.store_text(uri, txt)
 }
 
 // p.9.16.2/.4：取文档文本，并**记录一次访问**（LRU 记账的唯一入口——几乎所有
 // 请求分支都经此取文本）。文本若已被 LRU 回收（TSP_EVICT_TEXT=1）则冷重建。
-func get_doc(uri: string) -> string {
+pub func get_doc(uri: string) -> string {
     an.touch(uri)
     return an.ensure_text(uri)
 }
@@ -168,7 +168,7 @@ func json_field_int(s: string, key: string) -> i64 {
 
 // 子串查找（首个出现位置；未找到 -1）。**字节级**（str_byte O(1)；
 // str_char 本运行时单次 ~360µs，逐码点查找不可用）。
-func str_find(hay: string, needle: string) -> i64 {
+pub func str_find(hay: string, needle: string) -> i64 {
     var hl = len(hay)
     var nl = len(needle)
     if nl == 0 {
@@ -194,7 +194,7 @@ func str_find(hay: string, needle: string) -> i64 {
 }
 
 // 行号 → 行起始偏移（0 基）；越界返回文本长度。
-func line_start(txt: string, line: i64) -> i64 {
+pub func line_start(txt: string, line: i64) -> i64 {
     var off: i64 = 0
     var ln: i64 = 0
     while ln < line && off < len(txt) {
@@ -211,7 +211,7 @@ func line_start(txt: string, line: i64) -> i64 {
 }
 
 // 位置（line, char）→ 文件偏移。
-func pos_to_offset(txt: string, line: i64, character: i64) -> i64 {
+pub func pos_to_offset(txt: string, line: i64, character: i64) -> i64 {
     var off = line_start(txt, line)
     var moved: i64 = 0
     while moved < character && off + moved < len(txt) && str_byte(txt, off + moved) != 10 {
@@ -239,7 +239,7 @@ func uri_basename(uri: string) -> string {
 
 // uri → 文档目录（import 相对路径解析基准，尾随 '/'，正斜杠）。
 // 支持 file:/// 前缀与 Windows 盘符；非文件 uri（untitled: 等）返回 ""。
-func uri_to_dir(uri: string) -> string {
+pub func uri_to_dir(uri: string) -> string {
     var p = uri
     if has_prefix_str(p, "file://") {
         p = proto.substr_at(p, len("file://"), len(p))
@@ -404,7 +404,7 @@ func publish_diagnostics(uri: string, diagnostics: string) {
 // 同一域的唯一真相。hover 现已只走 `an.find_sym_named` + `an.sym_sig`（见
 // hover_result），少一份全文行扫描 + 每文档一条签名串副本。
 // 某位置处的标识符（向前/向后扩展字母数字_；字节级）。
-func ident_at(txt: string, off: i64) -> string {
+pub func ident_at(txt: string, off: i64) -> string {
     if off < 0 || off > len(txt) {
         return ""
     }

@@ -30,7 +30,7 @@ import "./protocol.tie" as proto
 namespace tsp_fmt {
 
 // 行起始偏移（line 0 基；越界返回文本长度；line < 0 返回 0）。
-func line_start(txt: string, line: i64) -> i64 {
+pub func line_start(txt: string, line: i64) -> i64 {
     var off: i64 = 0
     var ln: i64 = 0
     while ln < line && off < len(txt) {
@@ -46,7 +46,7 @@ func line_start(txt: string, line: i64) -> i64 {
 }
 
 // 按 \n 拆行（不含行尾换行符）。
-func split_lines(s: string) -> table<string> {
+pub func split_lines(s: string) -> table<string> {
     var out = table_new_string()
     var n = len(s)
     var i: i64 = 0

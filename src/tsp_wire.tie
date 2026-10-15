@@ -24,10 +24,10 @@ type tie<logic>
 var w_crc_tab: table<i64>;
 var w_crc_ready: i64 = 0;
 // 信封解码结果槽（最近一帧）
-var w_kind: i64 = -1;
-var w_stage: i64 = 0;
+pub var w_kind: i64 = -1;
+pub var w_stage: i64 = 0;
 var w_name: string = "";
-var w_pl: table<i64>;
+pub var w_pl: table<i64>;
 
 namespace tsp_wire {
 

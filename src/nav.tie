@@ -42,7 +42,7 @@ namespace tsp_nav {
 // ==================== 自足小工具 ====================
 
 // 行号（0-based）→ 行首偏移（越界返回文本长度）。
-func line_start(txt: string, line: i64) -> i64 {
+pub func line_start(txt: string, line: i64) -> i64 {
     var off: i64 = 0
     var ln: i64 = 0
     while ln < line && off < len(txt) {
@@ -58,13 +58,13 @@ func line_start(txt: string, line: i64) -> i64 {
 }
 
 // 单字符是否标识符延续字符（字母/数字/下划线；char_code 数值比较）。
-func is_idchar(c: string) -> bool {
+pub func is_idchar(c: string) -> bool {
     var v = char_code(c)
     return (v >= 65 && v <= 90) || (v >= 97 && v <= 122) || (v >= 48 && v <= 57) || v == 95
 }
 
 // 从 off 向两端扩展标识符；无标识符返回 ""。
-func ident_at(txt: string, off: i64) -> string {
+pub func ident_at(txt: string, off: i64) -> string {
     if off < 0 || off > len(txt) {
         return ""
     }
@@ -113,7 +113,7 @@ func qualified_at(txt: string, off: i64) -> string {
 }
 
 // 前缀判定。
-func has_prefix(s: string, p: string) -> bool {
+pub func has_prefix(s: string, p: string) -> bool {
     if len(s) < len(p) {
         return false
     }
@@ -128,7 +128,7 @@ func has_prefix(s: string, p: string) -> bool {
 }
 
 // 子串 [start, end)（越界钳位）。
-func substr(s: string, start: i64, end: i64) -> string {
+pub func substr(s: string, start: i64, end: i64) -> string {
     var a = start
     var b = end
     if a < 0 {
@@ -166,7 +166,7 @@ func loc_json(uri: string, name: string, line: i64, col: i64) -> string {
 }
 
 // 位置（line/character 0-based）→ 文件偏移。
-func pos_to_offset(txt: string, line: i64, character: i64) -> i64 {
+pub func pos_to_offset(txt: string, line: i64, character: i64) -> i64 {
     var off = line_start(txt, line)
     var moved: i64 = 0
     while moved < character && off + moved < len(txt) && str_byte(txt, off + moved) != 10 {
@@ -231,7 +231,7 @@ pub func definition(uri: string, txt: string, base_dir: string, line: i64, chara
 // ==================== references ====================
 
 // uri → 文档所在目录（import 相对路径解析基准；跨文件扫描用）。
-func uri_to_dir(uri: string) -> string {
+pub func uri_to_dir(uri: string) -> string {
     var p = uri
     if has_prefix(p, "file://") {
         p = proto.substr_at(p, len("file://"), len(p))

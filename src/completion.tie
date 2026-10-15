@@ -37,7 +37,7 @@ namespace tsp_comp {
 
 // ==================== 字符串小工具 ====================
 
-func has_prefix(s: string, p: string) -> bool {
+pub func has_prefix(s: string, p: string) -> bool {
     if len(s) < len(p) {
         return false
     }
@@ -52,7 +52,7 @@ func has_prefix(s: string, p: string) -> bool {
 }
 
 // 0-based 行 → 字节偏移（越界返回 len(txt)）。
-func line_start(txt: string, line: i64) -> i64 {
+pub func line_start(txt: string, line: i64) -> i64 {
     var off: i64 = 0
     var ln: i64 = 0
     while ln < line && off < len(txt) {
@@ -68,7 +68,7 @@ func line_start(txt: string, line: i64) -> i64 {
 }
 
 // 单字符是否为标识符字符（字母/数字/下划线）。
-func is_idchar(c: string) -> bool {
+pub func is_idchar(c: string) -> bool {
     var v = char_code(c)
     return (v >= 65 && v <= 90) || (v >= 97 && v <= 122) || (v >= 48 && v <= 57) || v == 95
 }
