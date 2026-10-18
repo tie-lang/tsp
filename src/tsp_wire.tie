@@ -262,11 +262,14 @@ pub func frame_encode_t(payload: table<i64>) -> table<i64> {
 
 // analyze 请求帧（信封 kind=6）：f1=src f2=base_dir f3=vpath f4=stages。
 pub func analyze_request(src: string, base: string, vpath: string, stages: i64) -> table<i64> {
+    // op=1 分析：f1=op f2=src f3=base_dir f4=vpath f5=stages
+    // （方法不用 kind 表达——kind=6 是唯一请求种类，见 tiec driver/serve.tie 头部）
     var inner = table_new_i64()
-    push_field(inner, 1, str_payload(src))
-    push_field(inner, 2, str_payload(base))
-    push_field(inner, 3, str_payload(vpath))
-    push_field(inner, 4, i64_payload(stages))
+    push_field(inner, 1, i64_payload(1))
+    push_field(inner, 2, str_payload(src))
+    push_field(inner, 3, str_payload(base))
+    push_field(inner, 4, str_payload(vpath))
+    push_field(inner, 5, i64_payload(stages))
     var env = table_new_i64()
     push_field(env, 1, i64_payload(6))
     push_field(env, 2, i64_payload(0))
@@ -499,7 +502,8 @@ pub func done_ok(p: table<i64>) -> i64 {
         if lr.1 < 0 || lr.0 < 0 || lr.1 + lr.0 > nb {
             return 0
         }
-        if (tr.0 >> 3) == 1 {
+        // done 载荷：f1=op f2=ok/rc f3=vpath f4=captured ⇒ 取 f2
+        if (tr.0 >> 3) == 2 {
             var vr = rd_varint(p, lr.1)
             if vr.1 < 0 {
                 return 0
