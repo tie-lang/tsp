@@ -255,7 +255,44 @@ func emit_name(node: i64, ref tl: table<i64>, ref tc: table<i64>, ref tlens: tab
     if c0 < 0 {
         c0 = 0
     }
-    tok_push(tl, tc, tlens, tt, l0, c0, l, t)
+    tok_push(tl, tc, tlens, tt, l0, c0, l, refine_tt(nm, t))
+}
+
+// 名字 → 语义 token 类型：对「变量」类做实体识别。
+// 路径限定符（util.helper 的 util）在 AST 里是普通变量节点，若不识别就只能拿到
+// 变量色，命名空间因此不显色——按符号索引把它升级成 namespace/struct/enum。
+// 只处理 fallback=TT_VARIABLE 的情形（其余类型由发射点已定性），避免逐 token 全表扫。
+func refine_tt(name: string, fallback: i64) -> i64 {
+    if fallback != TT_VARIABLE {
+        return fallback
+    }
+    var i: i64 = 0
+    while i < an.doc_count() {
+        var du = an.doc_uri(i)
+        var s = an.find_sym_named(du, name)
+        if s < 0 {
+            // 索引里命名空间名带尾点（collect_tops 记作 "util."），补一次匹配
+            s = an.find_sym_named(du, name + ".")
+        }
+        if s >= 0 {
+            var k = an.sym_kind(du, s)
+            if k == "namespace" {
+                return TT_NAMESPACE
+            }
+            if k == "struct" {
+                return TT_STRUCT
+            }
+            if k == "enum" {
+                return TT_ENUM
+            }
+            if k == "type" {
+                return TT_TYPE
+            }
+            return fallback
+        }
+        i = i + 1
+    }
+    return fallback
 }
 
 // 声明名令牌：关键字之后的名字（FN_DEF/STRUCT/ENUM）。
@@ -595,7 +632,7 @@ func sort_tokens(ref tl: table<i64>, ref tc: table<i64>, ref tlens: table<i64>, 
 
 // 令牌表 → LSP SemanticTokens delta 编码 JSON：{"data":[dLine,dStart,dLen,type,mod,...]}。
 // 相对上一令牌差分：行差 + （同行动列差 / 跨行取新列）；同行同位去重（保留首个）。
-func build_tokens_json(tl: table<i64>, tc: table<i64>, tlens: table<i64>, tt: table<i64>) -> string {
+func build_tokens_json(txt: string, tl: table<i64>, tc: table<i64>, tlens: table<i64>, tt: table<i64>) -> string {
     var sb = string_builder()
     sb_append(sb, "{\"data\":[")
     var n = len(tl)
@@ -606,6 +643,13 @@ func build_tokens_json(tl: table<i64>, tc: table<i64>, tlens: table<i64>, tt: ta
     var pp_c: i64 = -1
     var first: bool = true
     while i < n {
+        // 越界 token 丢弃：AST 里个别节点位置落到文本之外（实测会混出 12+ 行的
+        // 垃圾行），发出去只会污染客户端数据。按字节范围判定最精确。
+        if tl[i] < 0 || tc[i] < 0 ||
+           line_start(txt, tl[i]) + tc[i] + tlens[i] > len(txt) {
+            i = i + 1
+            continue
+        }
         if tl[i] == pp_l && tc[i] == pp_c {
             i = i + 1
             continue
@@ -776,7 +820,7 @@ pub func semantic_tokens(uri: string, txt: string, base_dir: string) -> string {
     var tt = table_new_i64()
     walk_tokens(g_file_roots[0], txt, tl, tc, tlens, tt, -1, -1)
     sort_tokens(tl, tc, tlens, tt)
-    return build_tokens_json(tl, tc, tlens, tt)
+    return build_tokens_json(txt, tl, tc, tlens, tt)
 }
 
 // 文档折叠区间：FoldingRange JSON 数组（0 基 startLine/endLine）。
