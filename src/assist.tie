@@ -1,0 +1,1043 @@
+type tie<logic>
+// ============================================================================
+// assist.tie：tsp 高阶辅助能力
+//
+// 四项能力（均为标准 LSP 方法，server 路由转发到此）：
+//   ① selection_ranges —— textDocument/selectionRange，按位置返回嵌套选择范围
+//   ② inlay_hints      —— textDocument/inlayHint，函数调用参数名提示
+//   ③ 调用层次         —— prepare_call_hierarchy / outgoing_calls / incoming_calls
+//   ④ extract_actions  —— 提取常量 / 提取函数（refactor.extract 代码操作）
+//
+// 数据来源：tsp_ast 的 AST 列容器（s_tags/s_names/s_children/...）与
+// analyze 的符号索引（sym_sig 签名串里含参数名，解析取用）。
+// AST 末端无显式结束位置，按「子树末端 + 补右括号」近似（node_end）。
+//
+// 本文件编译：随 server.tie 一起编译（server 主入口 import 本文件）。
+// ============================================================================
+
+import "./analyze.tie" as an
+import "./protocol.tie" as proto
+import "./tsp_ast.tie"
+
+// ---- AST 节点 tag（对齐 tokens.tie 的数值；本文件独立定义避免重名）----
+const AT_VAR: i64 = 6
+const AT_CALL: i64 = 7
+const AT_FIELD_ACCESS: i64 = 15
+const AT_METHOD_CALL: i64 = 18
+const AT_VAR_DECL: i64 = 100
+const AT_FN_DEF: i64 = 101
+const AT_EXPR_STMT: i64 = 102
+const AT_ASSIGN: i64 = 103
+const AT_RETURN: i64 = 104
+const AT_IF: i64 = 105
+const AT_WHILE: i64 = 106
+const AT_FOR: i64 = 107
+const AT_SWITCH: i64 = 110
+const AT_IMPORT: i64 = 111
+const AT_NAMESPACE: i64 = 112
+const AT_STRUCT: i64 = 114
+const AT_PARAM: i64 = 118
+const AT_STMTLIST: i64 = 122
+const AT_ENUM: i64 = 128
+const AT_UNSAFE_BLOCK: i64 = 130
+const AT_TRY: i64 = 133
+
+namespace tsp_as {
+
+// ==================== 位置与范围工具 ====================
+
+// 行 → 行首偏移（0 基；越界返回文本长度）。
+func line_start(txt: string, line: i64) -> i64 {
+    var off: i64 = 0
+    var ln: i64 = 0
+    while ln < line && off < len(txt) {
+        while off < len(txt) && str_byte(txt, off) != 10 {
+            off = off + 1
+        }
+        if off < len(txt) {
+            off = off + 1
+        }
+        ln = ln + 1
+    }
+    return off
+}
+
+// 行长（字节；不含换行）。
+func line_len(txt: string, line: i64) -> i64 {
+    var off = line_start(txt, line)
+    var i = off
+    while i < len(txt) && str_byte(txt, i) != 10 {
+        i = i + 1
+    }
+    return i - off
+}
+
+// 偏移 → (行, 列) 0-based。
+func offset_to_pos(txt: string, off: i64) -> (i64, i64) {
+    var line: i64 = 0
+    var i: i64 = 0
+    while i < off && i < len(txt) {
+        if str_byte(txt, i) == 10 {
+            line = line + 1
+        }
+        i = i + 1
+    }
+    return (line, off - line_start(txt, line))
+}
+
+// 节点是否可用（子表里的负哨兵/越界一律拒绝，避免 s_tags[-1] 越界 panic）。
+func node_ok(node: i64) -> bool {
+    return node >= 0 && node < len(s_tags)
+}
+
+// 取节点名（哨兵/无名返回空串）。
+func node_name(node: i64) -> string {
+    if !node_ok(node) {
+        return ""
+    }
+    var nid = s_names[node]
+    if nid < 0 {
+        return ""
+    }
+    return intern.lookup(nid)
+}
+
+// 节点名字宽度（无名按 1）。
+func name_width(node: i64) -> i64 {
+    if !node_ok(node) {
+        return 1
+    }
+    var nid = s_names[node]
+    if nid < 0 {
+        return 1
+    }
+    var w = len(intern.lookup(nid))
+    if w < 1 {
+        w = 1
+    }
+    return w
+}
+
+// 节点是否块状（末端要算到右花括号）。
+func is_block_tag(tag: i64) -> bool {
+    return tag == AT_FN_DEF || tag == AT_STRUCT || tag == AT_ENUM || tag == AT_NAMESPACE ||
+           tag == AT_IF || tag == AT_WHILE || tag == AT_FOR || tag == AT_SWITCH ||
+           tag == AT_TRY || tag == AT_UNSAFE_BLOCK
+}
+
+// 节点起始偏移。
+func node_start_off(txt: string, node: i64) -> i64 {
+    if !node_ok(node) {
+        return 0
+    }
+    var l = s_lines[node] - 1
+    var c = s_cols[node] - 1
+    if l < 0 {
+        l = 0
+    }
+    if c < 0 {
+        c = 0
+    }
+    return line_start(txt, l) + c
+}
+
+// 节点末端偏移（含右括号/右花括号补偿）。
+func node_end_off(txt: string, node: i64) -> i64 {
+    if !node_ok(node) {
+        return node_start_off(txt, node)
+    }
+    var tag = s_tags[node]
+    if is_block_tag(tag) {
+        // 块状：算到块尾行行末（含右花括号）
+        var el = block_end_line(node)
+        if el < 0 {
+            return node_start_off(txt, node) + name_width(node)
+        }
+        return line_start(txt, el) + line_len(txt, el)
+    }
+    var e: i64 = 0
+    var nc = s_nchild[node]
+    if nc > 0 {
+        e = node_end_off(txt, s_children[s_coff[node] + nc - 1])
+    } else {
+        e = node_start_off(txt, node) + name_width(node)
+    }
+    // 补右括号：f(a, b) 末端落在 b 后，把紧随的 ) ] } 吃进来
+    while e < len(txt) {
+        var c = str_byte(txt, e)
+        if c == 41 || c == 93 || c == 125 {
+            e = e + 1
+        } else {
+            break
+        }
+    }
+    return e
+}
+
+// 块尾行（沿用 tokens.tie 的取法：最后一个子块的末语句行）。
+func block_end_line(node: i64) -> i64 {
+    if !node_ok(node) {
+        return -1
+    }
+    var nc = s_nchild[node]
+    if nc <= 0 {
+        return -1
+    }
+    var last = s_children[s_coff[node] + nc - 1]
+    if last < 0 {
+        return -1
+    }
+    if s_tags[last] == AT_STMTLIST {
+        var nc2 = s_nchild[last]
+        if nc2 <= 0 {
+            return s_lines[last] - 1
+        }
+        var last2 = s_children[s_coff[last] + nc2 - 1]
+        if last2 >= 0 {
+            return node_end_line(last2)
+        }
+        return s_lines[last] - 1
+    }
+    return node_end_line(last)
+}
+
+// 节点末端行（叶子用起始行；块状递归）。
+func node_end_line(node: i64) -> i64 {
+    if !node_ok(node) {
+        return 0
+    }
+    if is_block_tag(s_tags[node]) {
+        var e = block_end_line(node)
+        if e >= 0 {
+            return e
+        }
+    }
+    var nc = s_nchild[node]
+    if nc > 0 {
+        return node_end_line(s_children[s_coff[node] + nc - 1])
+    }
+    return s_lines[node] - 1
+}
+
+// 单个 Range JSON（0-based）。
+func range_json_off(txt: string, s: i64, e: i64) -> string {
+    var (l0, c0) = offset_to_pos(txt, s)
+    var (l1, c1) = offset_to_pos(txt, e)
+    return "{\"start\":{\"line\":" + to_string(l0) + ",\"character\":" + to_string(c0) +
+           "},\"end\":{\"line\":" + to_string(l1) + ",\"character\":" + to_string(c1) + "}}"
+}
+
+// 位置是否落在 [s,e) 内。
+func off_in(s: i64, e: i64, off: i64) -> bool {
+    return off >= s && off <= e
+}
+
+// ==================== ① 选择范围 ====================
+
+// 收集包含 off 的所有节点范围（外→内）。
+func collect_chain(node: i64, txt: string, off: i64, ref ss: table<i64>, ref ee: table<i64>) {
+    if !node_ok(node) {
+        return
+    }
+    var s = node_start_off(txt, node)
+    var e = node_end_off(txt, node)
+    if !off_in(s, e, off) {
+        return
+    }
+    table_push(ss, s)
+    table_push(ee, e)
+    var nc = s_nchild[node]
+    var base = s_coff[node]
+    var k: i64 = 0
+    while k < nc {
+        var c = s_children[base + k]
+        var cs = node_start_off(txt, c)
+        var ce = node_end_off(txt, c)
+        if off_in(cs, ce, off) {
+            collect_chain(c, txt, off, ss, ee)
+            break
+        }
+        k = k + 1
+    }
+}
+
+// textDocument/selectionRange：返回 SelectionRange 链（内→外，parent 串起来）。
+// line/character 0-based。AST 不可用时返回 []。
+pub func selection_ranges(txt: string, line: i64, character: i64) -> string {
+    var ok = an.run_check(txt, "")
+    if ok != 1 || len(g_file_roots) == 0 {
+        return "[]"
+    }
+    var off = line_start(txt, line) + character
+    var ss = table_new_i64()
+    var ee = table_new_i64()
+    collect_chain(g_file_roots[0], txt, off, ss, ee)
+    var n = len(ss)
+    if n == 0 {
+        // 兜底：整行
+        var ls = line_start(txt, line)
+        var r = range_json_off(txt, ls, ls + line_len(txt, line))
+        return "[{\"range\":" + r + "}]"
+    }
+    // 由内向外串成 parent 链
+    var out: string = ""
+    var i: i64 = n - 1
+    while i >= 0 {
+        var r = range_json_off(txt, ss[i], ee[i])
+        if len(out) == 0 {
+            out = "{\"range\":" + r + "}"
+        } else {
+            out = "{\"range\":" + r + ",\"parent\":" + out + "}"
+        }
+        if i == 0 {
+            break
+        }
+        i = i - 1
+    }
+    return "[" + out + "]"
+}
+
+// ==================== ② 内联提示（参数名） ====================
+
+// 从签名串解析参数名列表：`func add(a: i64, b: i64) -> i64` → [a, b]。
+pub func parse_param_names(sig: string) -> table<string> {
+    var out = table_new_string()
+    // 定位第一个 '(' 与其配对 ')'
+    var l = str_find_ch(sig, 40)
+    if l < 0 {
+        return out
+    }
+    var depth: i64 = 0
+    var r: i64 = -1
+    var i = l
+    while i < len(sig) {
+        var c = str_byte(sig, i)
+        if c == 40 {
+            depth = depth + 1
+        } else if c == 41 {
+            depth = depth - 1
+            if depth == 0 {
+                r = i
+                break
+            }
+        }
+        i = i + 1
+    }
+    if r < 0 {
+        return out
+    }
+    // 按逗号切参（忽略嵌套括号/尖括号内的逗号）
+    var start = l + 1
+    depth = 0
+    i = start
+    while i <= r {
+        var c2 = 0
+        if i < r {
+            c2 = str_byte(sig, i)
+        } else {
+            c2 = 44
+        }
+        if c2 == 40 || c2 == 60 {
+            depth = depth + 1
+        } else if c2 == 41 || c2 == 62 {
+            depth = depth - 1
+        } else if c2 == 44 && depth == 0 {
+            var seg = trim_ws(proto.substr_at(sig, start, i))
+            var nm = param_name_of(seg)
+            if len(nm) > 0 {
+                table_push(out, nm)
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 单个形参段取名字：`a: i64` → `a`；`ref t: table<i64>` → `t`。
+func param_name_of(seg: string) -> string {
+    var s = trim_ws(seg)
+    // 跳过修饰词（ref/immut/move/deep/shared/in/out）
+    while true {
+        var sp = str_find_ch(s, 32)
+        if sp < 0 {
+            break
+        }
+        var head = proto.substr_at(s, 0, sp)
+        if head == "ref" || head == "immut" || head == "move" || head == "deep" ||
+           head == "shared" || head == "in" || head == "out" {
+            s = trim_ws(proto.substr_at(s, sp + 1, len(s)))
+        } else {
+            break
+        }
+    }
+    // 取冒号前部分
+    var cl = str_find_ch(s, 58)
+    if cl > 0 {
+        s = proto.substr_at(s, 0, cl)
+    }
+    return trim_ws(s)
+}
+
+// 首个指定字节位置（未找到 -1）。
+func str_find_ch(s: string, b: i64) -> i64 {
+    var i: i64 = 0
+    while i < len(s) {
+        if str_byte(s, i) == b {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 去首尾空白（空格/制表）。
+func trim_ws(s: string) -> string {
+    var a: i64 = 0
+    var b = len(s)
+    while a < b {
+        var c = str_byte(s, a)
+        if c == 32 || c == 9 {
+            a = a + 1
+        } else {
+            break
+        }
+    }
+    while b > a {
+        var c = str_byte(s, b - 1)
+        if c == 32 || c == 9 {
+            b = b - 1
+        } else {
+            break
+        }
+    }
+    return proto.substr_at(s, a, b)
+}
+
+// 收集区间内的调用实参提示。
+func collect_inlay(node: i64, txt: string, lo: i64, hi: i64, ref out: table<string>) {
+    if !node_ok(node) {
+        return
+    }
+    var tag = s_tags[node]
+    if tag == AT_CALL || tag == AT_METHOD_CALL {
+        var nid = s_names[node]
+        if nid >= 0 {
+            var fname = intern.lookup(nid)
+            // 实参 = 去掉被调者后的子节点（CALL 子节点 [callee, arg0, arg1, ...]）
+            var nc = s_nchild[node]
+            var base = s_coff[node]
+            if nc >= 2 {
+                var sig = find_sig_anywhere(fname)
+                if len(sig) > 0 {
+                    var pnames = parse_param_names(sig)
+                    var ai: i64 = 0
+                    while ai < len(pnames) && ai + 1 < nc {
+                        var arg = s_children[base + ai + 1]
+                        var as2 = node_start_off(txt, arg)
+                        if as2 >= lo && as2 <= hi {
+                            var (al, ac) = offset_to_pos(txt, as2)
+                            table_push(out, "{\"position\":{\"line\":" + to_string(al) +
+                                      ",\"character\":" + to_string(ac) +
+                                      "},\"label\":" + proto.json_str(pnames[ai] + ":") +
+                                      ",\"kind\":2,\"paddingLeft\":false,\"paddingRight\":true}")
+                        }
+                        ai = ai + 1
+                    }
+                }
+            }
+        }
+    }
+    var nc2 = s_nchild[node]
+    var base2 = s_coff[node]
+    var k: i64 = 0
+    while k < nc2 {
+        var c = s_children[base2 + k]
+        if node_start_off(txt, c) <= hi {
+            collect_inlay(c, txt, lo, hi, out)
+        }
+        k = k + 1
+    }
+}
+
+// 名字匹配：精确 或 限定名后缀（helper 匹配 util.helper）。
+func name_match(want: string, have: string) -> bool {
+    if want == have {
+        return true
+    }
+    var suffix = "." + want
+    var hl = len(have)
+    var sl = len(suffix)
+    if hl <= sl {
+        return false
+    }
+    var i: i64 = 0
+    while i < sl {
+        if str_byte(have, hl - sl + i) != str_byte(suffix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 跨文档找函数符号（精确 → 限定名后缀）。
+func find_fn_anywhere(name: string) -> (string, i64) {
+    var i: i64 = 0
+    while i < an.doc_count() {
+        var du = an.doc_uri(i)
+        var s = find_fn_in_doc(du, name)
+        if s >= 0 {
+            return (du, s)
+        }
+        i = i + 1
+    }
+    return ("", -1)
+}
+
+// 单文档内找函数符号（精确 → 限定名后缀）。
+func find_fn_in_doc(uri: string, name: string) -> i64 {
+    var s = an.find_sym_named(uri, name)
+    if s >= 0 && an.sym_kind(uri, s) == "func" {
+        return s
+    }
+    var n = an.sym_count(uri)
+    if n < 0 {
+        return -1
+    }
+    var i: i64 = 0
+    while i < n {
+        if an.sym_kind(uri, i) == "func" && name_match(name, an.sym_name(uri, i)) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 跨文档找任意符号签名（精确 → 限定名后缀）。
+func find_sig_anywhere(name: string) -> string {
+    var (du, s) = find_fn_anywhere(name)
+    if s >= 0 {
+        return an.sym_sig(du, s)
+    }
+    // 非函数符号（全局/结构等）也允许查签名
+    var i: i64 = 0
+    while i < an.doc_count() {
+        var d2 = an.doc_uri(i)
+        var n = an.sym_count(d2)
+        if n > 0 {
+            var k: i64 = 0
+            while k < n {
+                if name_match(name, an.sym_name(d2, k)) {
+                    return an.sym_sig(d2, k)
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// textDocument/inlayHint：返回 InlayHint[] JSON。
+// range 为 [line0,char0]..[line1,char1]（0-based）；AST 不可用返回 []。
+pub func inlay_hints(txt: string, l0: i64, c0: i64, l1: i64, c1: i64) -> string {
+    var ok = an.run_check(txt, "")
+    if ok != 1 || len(g_file_roots) == 0 {
+        return "[]"
+    }
+    var lo = line_start(txt, l0) + c0
+    var hi = line_start(txt, l1) + c1
+    var out = table_new_string()
+    collect_inlay(g_file_roots[0], txt, lo, hi, out)
+    var sb = string_builder()
+    sb_append(sb, "[")
+    var i: i64 = 0
+    while i < len(out) {
+        if i > 0 {
+            sb_append(sb, ",")
+        }
+        sb_append(sb, out[i])
+        i = i + 1
+    }
+    sb_append(sb, "]")
+    return sb_build(sb)
+}
+
+// ==================== ③ 调用层次 ====================
+
+// 单个 CallHierarchyItem JSON。
+func call_item_json(name: string, uri: string, sig: string, line: i64, col: i64) -> string {
+    var l0 = line - 1
+    var c0 = col - 1
+    if l0 < 0 {
+        l0 = 0
+    }
+    if c0 < 0 {
+        c0 = 0
+    }
+    var r = "{\"start\":{\"line\":" + to_string(l0) + ",\"character\":" + to_string(c0) +
+            "},\"end\":{\"line\":" + to_string(l0) + ",\"character\":" + to_string(c0 + len(name)) + "}}"
+    return "{\"name\":" + proto.json_str(name) + ",\"kind\":12,\"detail\":" + proto.json_str(sig) +
+           ",\"uri\":" + proto.json_str(uri) + ",\"range\":" + r + ",\"selectionRange\":" + r + "}"
+}
+
+// 光标处的函数项（供 prepare_call_hierarchy）。
+pub func prepare_call_hierarchy(txt: string, line: i64, character: i64) -> string {
+    var ok = an.run_check(txt, "")
+    if ok != 1 {
+        return "null"
+    }
+    var off = line_start(txt, line) + character
+    var name = name_at_off(txt, off)
+    if len(name) == 0 {
+        return "null"
+    }
+    var (furi, s) = find_fn_anywhere(name)
+    if s < 0 {
+        return "null"
+    }
+    return "[" + call_item_json(name, furi, an.sym_sig(furi, s), an.sym_line(furi, s), an.sym_col(furi, s)) + "]"
+}
+
+// 偏移处标识符（向两端扩展）。
+func name_at_off(txt: string, off: i64) -> string {
+    if off < 0 || off > len(txt) {
+        return ""
+    }
+    var a = off
+    while a > 0 && is_id_byte(str_byte(txt, a - 1)) {
+        a = a - 1
+    }
+    var b = off
+    while b < len(txt) && is_id_byte(str_byte(txt, b)) {
+        b = b + 1
+    }
+    if a >= b {
+        return ""
+    }
+    return proto.substr_at(txt, a, b)
+}
+
+func is_id_byte(b: i64) -> bool {
+    return (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95
+}
+
+// 收集子树里的调用名 → 调用点（供 outgoing）。
+// 路径调用（util.helper）的被调名可能挂在首个子节点上，CALL 自身名字为空时取之。
+func collect_calls(node: i64, ref names: table<string>, ref ls: table<i64>, ref cs: table<i64>) {
+    if !node_ok(node) {
+        return
+    }
+    var tag = s_tags[node]
+    if tag == AT_CALL || tag == AT_METHOD_CALL {
+        var nm = node_name(node)
+        if len(nm) == 0 && s_nchild[node] > 0 {
+            var c0 = s_children[s_coff[node]]
+            if node_ok(c0) {
+                nm = node_name(c0)
+            }
+        }
+        if len(nm) > 0 {
+            table_push(names, nm)
+            table_push(ls, s_lines[node])
+            table_push(cs, s_cols[node])
+        }
+    }
+    var nc = s_nchild[node]
+    var base = s_coff[node]
+    var k: i64 = 0
+    while k < nc {
+        collect_calls(s_children[base + k], names, ls, cs)
+        k = k + 1
+    }
+}
+
+// 起始偏移落在 [s,e) 内的最深节点。
+func deepest_in(node: i64, txt: string, s: i64, e: i64) -> i64 {
+    if !node_ok(node) {
+        return -1
+    }
+    var ns = node_start_off(txt, node)
+    var ne = node_end_off(txt, node)
+    if ns > s || ne < e {
+        return -1
+    }
+    var nc = s_nchild[node]
+    var base = s_coff[node]
+    var k: i64 = 0
+    while k < nc {
+        var r = deepest_in(s_children[base + k], txt, s, e)
+        if r >= 0 {
+            return r
+        }
+        k = k + 1
+    }
+    return node
+}
+
+// 找函数定义节点（按名字）。
+func find_fn_node(node: i64, name: string) -> i64 {
+    if !node_ok(node) {
+        return -1
+    }
+    if s_tags[node] == AT_FN_DEF {
+        var nid = s_names[node]
+        if nid >= 0 && name_match(name, intern.lookup(nid)) {
+            return node
+        }
+    }
+    var nc = s_nchild[node]
+    var base = s_coff[node]
+    var k: i64 = 0
+    while k < nc {
+        var r = find_fn_node(s_children[base + k], name)
+        if r >= 0 {
+            return r
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// 出边：本函数体内调用了谁。name_hint 为 item.name（有则优先），
+// 否则从 line/character 处的标识符推断。
+pub func outgoing_calls(txt: string, name_hint: string, line: i64, character: i64) -> string {
+    var ok = an.run_check(txt, "")
+    if ok != 1 || len(g_file_roots) == 0 {
+        return "[]"
+    }
+    var fname = name_hint
+    if len(fname) == 0 {
+        var off = line_start(txt, line) + character
+        fname = name_at_off(txt, off)
+    }
+    if len(fname) == 0 {
+        return "[]"
+    }
+    var fn = find_fn_node(g_file_roots[0], fname)
+    if fn < 0 {
+        return "[]"
+    }
+    var names = table_new_string()
+    var ls = table_new_i64()
+    var cs = table_new_i64()
+    collect_calls(fn, names, ls, cs)
+    // 同名被调归并（fromRanges 聚合）
+    var sb = string_builder()
+    sb_append(sb, "[")
+    var emitted = table_new_string()
+    var first: bool = true
+    var i: i64 = 0
+    while i < len(names) {
+        var callee = names[i]
+        if !str_in(emitted, callee) {
+            table_push(emitted, callee)
+            var (furi, s) = find_fn_anywhere(callee)
+            if s >= 0 {
+                if !first {
+                    sb_append(sb, ",")
+                }
+                first = false
+                sb_append(sb, "{\"to\":")
+                sb_append(sb, call_item_json(callee, furi, an.sym_sig(furi, s), an.sym_line(furi, s), an.sym_col(furi, s)))
+                sb_append(sb, ",\"fromRanges\":[")
+                var j: i64 = 0
+                var f2: bool = true
+                while j < len(names) {
+                    if names[j] == callee {
+                        if !f2 {
+                            sb_append(sb, ",")
+                        }
+                        f2 = false
+                        var cl = ls[j] - 1
+                        var cc = cs[j] - 1
+                        if cl < 0 {
+                            cl = 0
+                        }
+                        if cc < 0 {
+                            cc = 0
+                        }
+                        sb_append(sb, "{\"start\":{\"line\":")
+                        sb_append(sb, to_string(cl))
+                        sb_append(sb, ",\"character\":")
+                        sb_append(sb, to_string(cc))
+                        sb_append(sb, "},\"end\":{\"line\":")
+                        sb_append(sb, to_string(cl))
+                        sb_append(sb, ",\"character\":")
+                        sb_append(sb, to_string(cc + len(callee)))
+                        sb_append(sb, "}}")
+                    }
+                    j = j + 1
+                }
+                sb_append(sb, "]}")
+            }
+        }
+        i = i + 1
+    }
+    sb_append(sb, "]")
+    return sb_build(sb)
+}
+
+// 入边：谁调用了本函数（跨已索引文档）。
+pub func incoming_calls(name: string) -> string {
+    var sb = string_builder()
+    sb_append(sb, "[")
+    var first: bool = true
+    var (turi, ts) = find_fn_anywhere(name)
+    if ts < 0 {
+        return "[]"
+    }
+    var i: i64 = 0
+    while i < an.doc_count() {
+        var du = an.doc_uri(i)
+        if len(du) > 0 {
+            var callers = table_new_string()
+            var cl = table_new_i64()
+            var cc = table_new_i64()
+            collect_callers_of(du, name, callers, cl, cc)
+            var k: i64 = 0
+            while k < len(callers) {
+                var caller = callers[k]
+                var (furi, s) = find_fn_anywhere(caller)
+                if s >= 0 {
+                    if !first {
+                        sb_append(sb, ",")
+                    }
+                    first = false
+                    sb_append(sb, "{\"from\":")
+                    sb_append(sb, call_item_json(caller, furi, an.sym_sig(furi, s), an.sym_line(furi, s), an.sym_col(furi, s)))
+                    sb_append(sb, ",\"fromRanges\":[{\"start\":{\"line\":")
+                    sb_append(sb, to_string(cl[k] - 1))
+                    sb_append(sb, ",\"character\":")
+                    sb_append(sb, to_string(cc[k] - 1))
+                    sb_append(sb, "},\"end\":{\"line\":")
+                    sb_append(sb, to_string(cl[k] - 1))
+                    sb_append(sb, ",\"character\":")
+                    sb_append(sb, to_string(cc[k] - 1 + len(name)))
+                    sb_append(sb, "}}]}")
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    sb_append(sb, "]")
+    return sb_build(sb)
+}
+
+// 收集某文档内「调用了 target 的函数」及其调用点。
+func collect_callers_of(uri: string, target: string, ref fns: table<string>,
+                        ref ls: table<i64>, ref cs: table<i64>) {
+    // 需要该文档 AST：用该文档文本重跑分析
+    var txt = an.fetch_text(uri)
+    if len(txt) == 0 {
+        return
+    }
+    var ok = an.run_check(txt, "")
+    if ok != 1 || len(g_file_roots) == 0 {
+        return
+    }
+    collect_callers_node(g_file_roots[0], "", target, fns, ls, cs)
+}
+
+// 递归：在函数体内找对 target 的调用，记下所属函数名。
+func collect_callers_node(node: i64, owner: string, target: string,
+                          ref fns: table<string>, ref ls: table<i64>, ref cs: table<i64>) {
+    if !node_ok(node) {
+        return
+    }
+    var tag = s_tags[node]
+    var next_owner = owner
+    if tag == AT_FN_DEF {
+        var nid = s_names[node]
+        if nid >= 0 {
+            next_owner = intern.lookup(nid)
+        }
+    }
+    if (tag == AT_CALL || tag == AT_METHOD_CALL) && len(next_owner) > 0 {
+        var nid2 = s_names[node]
+        if nid2 >= 0 && name_match(target, intern.lookup(nid2)) && !name_match(next_owner, target) {
+            table_push(fns, next_owner)
+            table_push(ls, s_lines[node])
+            table_push(cs, s_cols[node])
+        }
+    }
+    var nc = s_nchild[node]
+    var base = s_coff[node]
+    var k: i64 = 0
+    while k < nc {
+        collect_callers_node(s_children[base + k], next_owner, target, fns, ls, cs)
+        k = k + 1
+    }
+}
+
+// 表里是否已含字符串。
+func str_in(t: table<string>, s: string) -> bool {
+    var i: i64 = 0
+    while i < len(t) {
+        if t[i] == s {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ==================== ④ 提取常量 / 提取函数 ====================
+
+// 单条 CodeAction（多编辑）。
+func mk_action(title: string, kind: string, uri: string, edits: table<string>) -> string {
+    var sb = string_builder()
+    sb_append(sb, "{\"title\":")
+    sb_append(sb, proto.json_str(title))
+    sb_append(sb, ",\"kind\":")
+    sb_append(sb, proto.json_str(kind))
+    sb_append(sb, ",\"edit\":{\"changes\":{")
+    sb_append(sb, proto.json_str(uri))
+    sb_append(sb, ":[")
+    var i: i64 = 0
+    while i < len(edits) {
+        if i > 0 {
+            sb_append(sb, ",")
+        }
+        sb_append(sb, edits[i])
+        i = i + 1
+    }
+    sb_append(sb, "]}}}")
+    return sb_build(sb)
+}
+
+// 单条 TextEdit JSON（范围替换）。
+func mk_edit(txt: string, s: i64, e: i64, new_text: string) -> string {
+    return "{\"range\":" + range_json_off(txt, s, e) + ",\"newText\":" + proto.json_str(new_text) + "}"
+}
+
+// 找语句起始（该行行首）。
+func stmt_start_off(txt: string, off: i64) -> i64 {
+    var (l, _) = offset_to_pos(txt, off)
+    return line_start(txt, l)
+}
+
+// textDocument/codeAction 的 refactor.extract 分支：
+// 选中一段表达式/语句时提供「提取常量」与「提取函数」。
+// line/character 0-based；选区为空返回 "[]"。
+pub func extract_actions(uri: string, txt: string, l0: i64, c0: i64, l1: i64, c1: i64) -> string {
+    var s = line_start(txt, l0) + c0
+    var e = line_start(txt, l1) + c1
+    if e <= s {
+        return "[]"
+    }
+    var sel = proto.substr_at(txt, s, e)
+    if len(trim_ws(sel)) == 0 {
+        return "[]"
+    }
+    var actions = table_new_string()
+    // 插入点：选区所在行的行首
+    var ins = stmt_start_off(txt, s)
+
+    // ---- 提取常量：const NAME = <sel>; ----
+    var cname = suggest_name(txt, s, "VALUE")
+    var cdecl = "const " + cname + " = " + trim_ws(sel) + "\n"
+    var ce1 = mk_edit(txt, s, e, cname)
+    var ce2 = mk_edit(txt, ins, ins, cdecl)
+    var cedits = table_new_string()
+    table_push(cedits, ce2)
+    table_push(cedits, ce1)
+    table_push(actions, mk_action("提取常量 " + cname, "refactor.extract", uri, cedits))
+
+    // ---- 提取函数：func NAME() { <sel> } ----
+    var fname2 = suggest_name(txt, s, "extracted")
+    var body = trim_ws(sel)
+    // 选区是单表达式 → 用 return 包起来
+    var is_expr = str_find_ch(sel, 59) < 0 && str_find_ch(sel, 10) < 0
+    var fbody: string = ""
+    if is_expr {
+        fbody = "func " + fname2 + "() -> i64 {\n    return " + body + "\n}\n"
+    } else {
+        fbody = "func " + fname2 + "() {\n" + indent_block(body) + "\n}\n"
+    }
+    var fe1 = mk_edit(txt, s, e, fname2 + "()")
+    var fe2 = mk_edit(txt, ins, ins, fbody)
+    var fedits = table_new_string()
+    table_push(fedits, fe2)
+    table_push(fedits, fe1)
+    table_push(actions, mk_action("提取函数 " + fname2, "refactor.extract", uri, fedits))
+
+    var sb = string_builder()
+    sb_append(sb, "[")
+    var i: i64 = 0
+    while i < len(actions) {
+        if i > 0 {
+            sb_append(sb, ",")
+        }
+        sb_append(sb, actions[i])
+        i = i + 1
+    }
+    sb_append(sb, "]")
+    return sb_build(sb)
+}
+
+// 选区所在函数内是否已有同名（粗判：文本里是否出现该名）。
+func suggest_name(txt: string, off: i64, base: string) -> string {
+    var name = base
+    var n: i64 = 1
+    while name_appears(txt, name) {
+        name = base + to_string(n)
+        n = n + 1
+        if n > 99 {
+            break
+        }
+    }
+    return name
+}
+
+func name_appears(txt: string, name: string) -> bool {
+    var nl = len(name)
+    var i: i64 = 0
+    while i + nl <= len(txt) {
+        var matched: bool = true
+        var j: i64 = 0
+        while j < nl {
+            if str_byte(txt, i + j) != str_byte(name, j) {
+                matched = false
+                break
+            }
+            j = j + 1
+        }
+        if matched {
+            // 前后不能是标识符字符
+            var pre_ok = i == 0 || !is_id_byte(str_byte(txt, i - 1))
+            var post_ok = i + nl >= len(txt) || !is_id_byte(str_byte(txt, i + nl))
+            if pre_ok && post_ok {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 多行文本每行加四空格缩进。
+func indent_block(s: string) -> string {
+    var sb = string_builder()
+    var start: i64 = 0
+    var i: i64 = 0
+    var first: bool = true
+    while i <= len(s) {
+        if i == len(s) || str_byte(s, i) == 10 {
+            if !first {
+                sb_append(sb, "\n")
+            }
+            first = false
+            sb_append(sb, "    ")
+            sb_append(sb, proto.substr_at(s, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+}   // namespace tsp_as

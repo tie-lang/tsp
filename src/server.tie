@@ -33,6 +33,7 @@ import "./sigdoc.tie" as tsp_sig
 import "./tokens.tie" as tsp_tok
 import "./refactor.tie" as tsp_ref
 import "./format.tie" as tsp_fmt
+import "./assist.tie" as tsp_as
 using tsp_proto;
 
 // ---- 文档状态 ----
@@ -165,6 +166,42 @@ func json_field(s: string, key: string) -> string {
 func json_field_int(s: string, key: string) -> i64 {
     var v = json_field(s, key)
     return proto.parse_int_trim(v)
+}
+
+// 取 key 第 n 次出现的值（1-based；供 range.end 这类同名二次出现的字段）。
+// 实现：跳过前 n-1 次出现后再复用 json_field 的取值逻辑。
+func json_field_nth(s: string, key: string, n: i64) -> string {
+    var pat = "\"" + key + "\""
+    var rest = s
+    var k: i64 = 1
+    while k < n {
+        var idx = str_find(rest, pat)
+        if idx < 0 {
+            return ""
+        }
+        rest = proto.substr_at(rest, idx + len(pat), len(rest))
+        k = k + 1
+    }
+    return json_field(rest, key)
+}
+
+// 合并两个 JSON 数组串（形如 "[]"）为一个；任一为空按 "[]" 处理。
+func merge_arrays(a: string, b: string) -> string {
+    var inner_a = ""
+    if len(a) >= 2 {
+        inner_a = proto.substr_at(a, 1, len(a) - 1)
+    }
+    var inner_b = ""
+    if len(b) >= 2 {
+        inner_b = proto.substr_at(b, 1, len(b) - 1)
+    }
+    if len(inner_a) == 0 {
+        return "[" + inner_b + "]"
+    }
+    if len(inner_b) == 0 {
+        return "[" + inner_a + "]"
+    }
+    return "[" + inner_a + "," + inner_b + "]"
 }
 
 // 子串查找（首个出现位置；未找到 -1）。**字节级**（str_byte O(1)；
@@ -574,7 +611,7 @@ func main() -> i64 {
         if method == "initialize" {
             // 服务器能力声明（p.6.9.6-6.9.11：补全/定义/引用/签名/大纲/语义令牌/折叠/重命名/高亮/修复/格式化）
             var legend = "[\"namespace\",\"type\",\"class\",\"enum\",\"interface\",\"struct\",\"typeParameter\",\"parameter\",\"variable\",\"property\",\"enumMember\",\"event\",\"function\",\"method\",\"macro\",\"keyword\",\"modifier\",\"comment\",\"string\",\"number\",\"regexp\",\"operator\",\"decorator\"]"
-            var caps = "{\"textDocumentSync\":1,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"definitionProvider\":true,\"referencesProvider\":true,\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"renameProvider\":true,\"documentHighlightProvider\":true,\"codeActionProvider\":true,\"documentFormattingProvider\":true,\"foldingRangeProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":" + legend + ",\"tokenModifiers\":[]},\"full\":true}}"
+            var caps = "{\"textDocumentSync\":1,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"definitionProvider\":true,\"referencesProvider\":true,\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"renameProvider\":true,\"documentHighlightProvider\":true,\"codeActionProvider\":true,\"documentFormattingProvider\":true,\"foldingRangeProvider\":true,\"selectionRangeProvider\":true,\"inlayHintProvider\":true,\"callHierarchyProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":" + legend + ",\"tokenModifiers\":[]},\"full\":true}}"
             var res = "{\"capabilities\":" + caps + ",\"serverInfo\":{\"name\":\"tsp\",\"version\":\"0.3.0\"}}"
             proto.write_frame(make_response(resp_id, res))
             jsonrpc_ready = true
@@ -742,7 +779,7 @@ func main() -> i64 {
             proto.write_frame(make_response(resp_id, hr2))
         }
 
-        // 代码操作/快速修复（p.6.9.10）：取首个诊断的 range.start 与 message
+        // 代码操作/快速修复 + 提取（refactor.extract）
         else if method == "textDocument/codeAction" {
             var uri = json_field(body, "uri")
             var line = json_field_int(body, "line")
@@ -750,7 +787,51 @@ func main() -> i64 {
             var msg = json_field(body, "message")
             var txt = get_doc(uri)
             var qr = tsp_ref.quickfix(uri, txt, uri_to_dir(uri), line, character, msg)
-            proto.write_frame(make_response(resp_id, qr))
+            // 选区终点（range.end 是 "line"/"character" 的第二次出现）
+            var l1 = proto.parse_int_trim(json_field_nth(body, "line", 2))
+            var c1 = proto.parse_int_trim(json_field_nth(body, "character", 2))
+            var ex = tsp_as.extract_actions(uri, txt, line, character, l1, c1)
+            // 两组动作合并成一个数组（quickfix 与 refactor.extract 并列）
+            proto.write_frame(make_response(resp_id, merge_arrays(qr, ex)))
+        }
+
+        // 选择范围（扩展选区：标识符 → 表达式 → 语句 → 块）
+        else if method == "textDocument/selectionRange" {
+            var uri = json_field(body, "uri")
+            var line = json_field_int(body, "line")
+            var character = json_field_int(body, "character")
+            var txt = get_doc(uri)
+            proto.write_frame(make_response(resp_id, tsp_as.selection_ranges(txt, line, character)))
+        }
+
+        // 内联提示（函数调用参数名）
+        else if method == "textDocument/inlayHint" {
+            var uri = json_field(body, "uri")
+            var l0 = json_field_int(body, "line")
+            var c0 = json_field_int(body, "character")
+            var l1 = proto.parse_int_trim(json_field_nth(body, "line", 2))
+            var c1 = proto.parse_int_trim(json_field_nth(body, "character", 2))
+            var txt = get_doc(uri)
+            proto.write_frame(make_response(resp_id, tsp_as.inlay_hints(txt, l0, c0, l1, c1)))
+        }
+
+        // 调用层次：准备 / 出边 / 入边
+        else if method == "textDocument/prepareCallHierarchy" {
+            var uri = json_field(body, "uri")
+            var line = json_field_int(body, "line")
+            var character = json_field_int(body, "character")
+            var txt = get_doc(uri)
+            proto.write_frame(make_response(resp_id, tsp_as.prepare_call_hierarchy(txt, line, character)))
+        } else if method == "callHierarchy/outgoingCalls" {
+            var uri = json_field(body, "uri")
+            var nm = json_field(body, "name")
+            var line = json_field_int(body, "line")
+            var character = json_field_int(body, "character")
+            var txt = get_doc(uri)
+            proto.write_frame(make_response(resp_id, tsp_as.outgoing_calls(txt, nm, line, character)))
+        } else if method == "callHierarchy/incomingCalls" {
+            var nm = json_field(body, "name")
+            proto.write_frame(make_response(resp_id, tsp_as.incoming_calls(nm)))
         }
 
         // 文档格式化（p.6.9.11）
