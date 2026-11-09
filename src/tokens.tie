@@ -263,39 +263,181 @@ func emit_name(node: i64, ref tl: table<i64>, ref tc: table<i64>, ref tlens: tab
     tok_push(tl, tc, tlens, tt, l0, c0, l, refine_tt(nm, tt2))
 }
 
-// 名字 → 语义 token 类型：对「变量」类做实体识别。
-// 路径限定符（util.helper 的 util）在 AST 里是普通变量节点，若不识别就只能拿到
-// 变量色，命名空间因此不显色——按符号索引把它升级成 namespace/struct/enum。
-// 只处理 fallback=TT_VARIABLE 的情形（其余类型由发射点已定性），避免逐 token 全表扫。
+// ==================== 实体名映射（命名空间/结构体/枚举/类型 + import 别名） ====================
+// 目的：使用处的标识符（util.helper 的 util、tsp_nav.fn 的 tsp_nav）在 AST 里是
+// 普通变量节点，需要按符号类别升级语义 token 类型，否则只能拿变量色。
+//
+// 为什么建表而不是逐 token 查索引：
+//   · 逐 token 调 find_sym_named 是 docs×syms 的全表扫，大文件（千级 token）会明显拖慢；
+//   · **import 别名根本不在符号索引里**（collect_tops 不索引 import），只能从文本取。
+// 一次遍历建好，之后 O(小表) 查。
+var g_map_names: table<string>
+var g_map_tts: table<i64>
+var g_map_n: i64 = 0
+
+func map_reset() {
+    g_map_n = 0
+}
+
+func map_put(name: string, tt: i64) {
+    if len(name) == 0 {
+        return
+    }
+    if len(g_map_names) == g_map_n {
+        table_push(g_map_names, name)
+        table_push(g_map_tts, tt)
+    } else {
+        g_map_names[g_map_n] = name
+        g_map_tts[g_map_n] = tt
+    }
+    g_map_n = g_map_n + 1
+}
+
+// 查实体名 → 语义 token 类型；未命中返回 -1。
+func map_get(name: string) -> i64 {
+    var i: i64 = 0
+    while i < g_map_n {
+        if g_map_names[i] == name {
+            return g_map_tts[i]
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// txt 的 pos 处是否以 lit 开头。
+func at_lit(txt: string, pos: i64, lit: string) -> bool {
+    if pos + len(lit) > len(txt) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(lit) {
+        if str_byte(txt, pos + i) != str_byte(lit, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func is_ws_byte(b: i64) -> bool {
+    return b == 32 || b == 9 || b == 13 || b == 10
+}
+
+func is_id_byte(b: i64) -> bool {
+    return (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95
+}
+
+// 收集 `import "路径" as 别名` 的别名——这些别名在文件里当命名空间用，
+// 但 collect_tops 不索引 import ⇒ 必须从文本取（tie 的 import 严格一行一条）。
+func collect_imports(txt: string) {
+    var n = len(txt)
+    var i: i64 = 0
+    while i < n {
+        // 行首：跳过前导空白
+        var p = i
+        while p < n && (str_byte(txt, p) == 32 || str_byte(txt, p) == 9) {
+            p = p + 1
+        }
+        if at_lit(txt, p, "import") {
+            // 同行内找独立的 `as`
+            var q = p + 6
+            var line_end = q
+            while line_end < n && str_byte(txt, line_end) != 10 {
+                line_end = line_end + 1
+            }
+            var hit: i64 = 0 - 1
+            while q + 2 <= line_end {
+                if str_byte(txt, q) == 97 && str_byte(txt, q + 1) == 115 &&
+                   (q == 0 || is_ws_byte(str_byte(txt, q - 1))) &&
+                   is_ws_byte(str_byte(txt, q + 2)) {
+                    hit = q + 2
+                    break
+                }
+                q = q + 1
+            }
+            if hit >= 0 {
+                var a = hit
+                while a < line_end && is_ws_byte(str_byte(txt, a)) {
+                    a = a + 1
+                }
+                var b = a
+                while b < line_end && is_id_byte(str_byte(txt, b)) {
+                    b = b + 1
+                }
+                if b > a {
+                    map_put(proto.substr_at(txt, a, b), TT_NAMESPACE)
+                }
+            }
+        }
+        // 下一行
+        while i < n && str_byte(txt, i) != 10 {
+            i = i + 1
+        }
+        i = i + 1
+    }
+}
+
+// 建实体名映射：符号索引（命名空间/结构体/枚举/类型）+ 文本里的 import 别名。
+func build_kind_map(txt: string) {
+    map_reset()
+    var i: i64 = 0
+    while i < an.doc_count() {
+        var du = an.doc_uri(i)
+        var n = an.sym_count(du)
+        if n > 0 {
+            var k: i64 = 0
+            while k < n {
+                var kind = an.sym_kind(du, k)
+                var tt: i64 = 0 - 1
+                if kind == "namespace" {
+                    tt = TT_NAMESPACE
+                } else if kind == "struct" {
+                    tt = TT_STRUCT
+                } else if kind == "enum" {
+                    tt = TT_ENUM
+                } else if kind == "type" {
+                    tt = TT_TYPE
+                }
+                if tt >= 0 {
+                    var nm = an.sym_name(du, k)
+                    if kind == "namespace" {
+                        // 索引里命名空间名带尾点（"util." / "a.b."）：去掉尾点登记；
+                        // 多段命名空间再登记首段，供 a.b.fn() 这种引用识别。
+                        var cl = len(nm)
+                        if cl > 0 && str_byte(nm, cl - 1) == 46 {
+                            nm = proto.substr_at(nm, 0, cl - 1)
+                        }
+                        map_put(nm, tt)
+                        var q: i64 = 0
+                        while q < len(nm) {
+                            if str_byte(nm, q) == 46 {
+                                map_put(proto.substr_at(nm, 0, q), tt)
+                                break
+                            }
+                            q = q + 1
+                        }
+                    } else {
+                        map_put(nm, tt)
+                    }
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    collect_imports(txt)
+}
+
+// 名字 → 语义 token 类型：按实体名映射升级「变量」类。
+// 只处理 fallback=TT_VARIABLE（其余类型由发射点已定性）。
 func refine_tt(name: string, fallback: i64) -> i64 {
     if fallback != TT_VARIABLE {
         return fallback
     }
-    var i: i64 = 0
-    while i < an.doc_count() {
-        var du = an.doc_uri(i)
-        var s = an.find_sym_named(du, name)
-        if s < 0 {
-            // 索引里命名空间名带尾点（collect_tops 记作 "util."），补一次匹配
-            s = an.find_sym_named(du, name + ".")
-        }
-        if s >= 0 {
-            var k = an.sym_kind(du, s)
-            if k == "namespace" {
-                return TT_NAMESPACE
-            }
-            if k == "struct" {
-                return TT_STRUCT
-            }
-            if k == "enum" {
-                return TT_ENUM
-            }
-            if k == "type" {
-                return TT_TYPE
-            }
-            return fallback
-        }
-        i = i + 1
+    var tt = map_get(name)
+    if tt >= 0 {
+        return tt
     }
     return fallback
 }
@@ -894,6 +1036,8 @@ pub func semantic_tokens(uri: string, txt: string, base_dir: string) -> string {
     var tc = table_new_i64()
     var tlens = table_new_i64()
     var tt = table_new_i64()
+    // 先建实体名映射（命名空间/结构体/枚举/类型 + import 别名），供使用处识别
+    build_kind_map(txt)
     walk_tokens(g_file_roots[0], txt, tl, tc, tlens, tt, -1, -1)
     sort_tokens(tl, tc, tlens, tt)
     return build_tokens_json(txt, tl, tc, tlens, tt)
