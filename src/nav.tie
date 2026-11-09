@@ -178,10 +178,17 @@ pub func pos_to_offset(txt: string, line: i64, character: i64) -> i64 {
 // ==================== 跨文档符号查找 ====================
 
 // 当前文档优先，未中则跨文档枚举；返回 (符号所在 uri, 符号下标)；未找到 ("", -1)。
+// 精确名未中时按「短名后缀」回退（helper → util.helper），
+// 覆盖声明处光标只取到末段、而索引存限定名的情形。
 func find_anywhere(uri: string, name: string) -> (string, i64) {
     var s = an.find_sym_named(uri, name)
     if s >= 0 {
         return (uri, s)
+    }
+    var suffix = "." + name
+    var s2 = an.find_sym_suffix(uri, suffix)
+    if s2 >= 0 {
+        return (uri, s2)
     }
     var i: i64 = 0
     while i < an.doc_count() {
@@ -191,10 +198,121 @@ func find_anywhere(uri: string, name: string) -> (string, i64) {
             if t >= 0 {
                 return (du, t)
             }
+            var t2 = an.find_sym_suffix(du, suffix)
+            if t2 >= 0 {
+                return (du, t2)
+            }
         }
         i = i + 1
     }
     return ("", -1)
+}
+
+// 光标处符号的签名（供 hover）：短名精确 → 限定名回退（util.helper），跨文档。
+// 命中返回签名串；未命中或非函数符号返回空串。
+// 与 definition 的查找策略保持一致，避免「跳转能找到、hover 却空白」。
+pub func symbol_sig(uri: string, txt: string, line: i64, character: i64) -> string {
+    var off = pos_to_offset(txt, line, character)
+    var name = ident_at(txt, off)
+    if len(name) == 0 {
+        return ""
+    }
+    var (furi, s) = find_anywhere(uri, name)
+    if s < 0 {
+        var full = qualified_at(txt, off)
+        if len(full) > len(name) {
+            var (f2, s2) = find_anywhere(uri, full)
+            if s2 >= 0 {
+                furi = f2
+                s = s2
+            }
+        }
+    }
+    if s < 0 {
+        return ""
+    }
+    return an.sym_sig(furi, s)
+}
+
+// ==================== 工作区符号搜索 ====================
+
+// LSP SymbolKind 映射（注意与 CompletionItemKind 不同表）：
+// func→Function(12) struct→Struct(23) enum→Enum(10) global→Variable(13) namespace→Namespace(3)
+func symbol_kind_num(k: string) -> i64 {
+    if k == "func" {
+        return 12
+    }
+    if k == "struct" {
+        return 23
+    }
+    if k == "enum" {
+        return 10
+    }
+    if k == "global" {
+        return 13
+    }
+    if k == "namespace" {
+        return 3
+    }
+    return 12
+}
+
+// 单条 SymbolInformation JSON。
+func sym_info_json(uri: string, name: string, i: i64) -> string {
+    return "{\"name\":" + proto.json_str(name) +
+           ",\"kind\":" + to_string(symbol_kind_num(an.sym_kind(uri, i))) +
+           ",\"location\":" + loc_json(uri, name, an.sym_line(uri, i), an.sym_col(uri, i)) + "}"
+}
+
+// 符号名是否匹配 query：全名前缀 或 末段前缀（util.helper 对 query=hel）。
+// 空 query 全部命中。
+func sym_matches(name: string, query: string) -> bool {
+    if len(query) == 0 {
+        return true
+    }
+    if has_prefix(name, query) {
+        return true
+    }
+    var dot: i64 = -1
+    var i: i64 = 0
+    while i < len(name) {
+        if str_byte(name, i) == 46 {
+            dot = i
+        }
+        i = i + 1
+    }
+    if dot >= 0 && dot + 1 < len(name) {
+        return has_prefix(proto.substr_at(name, dot + 1, len(name)), query)
+    }
+    return false
+}
+
+// 工作区符号搜索（Ctrl+T）：遍历全部已索引文档的符号，按 query 过滤
+// （全名前缀 或 末段前缀）；空 query 返回全部。返回 SymbolInformation[] JSON。
+pub func workspace_symbols(query: string) -> string {
+    var out: string = "["
+    var first: bool = true
+    var di: i64 = 0
+    while di < an.doc_count() {
+        var du = an.doc_uri(di)
+        var n = an.sym_count(du)
+        if n > 0 {
+            var i: i64 = 0
+            while i < n {
+                var nm = an.sym_name(du, i)
+                if sym_matches(nm, query) {
+                    if !first {
+                        out = out + ","
+                    }
+                    first = false
+                    out = out + sym_info_json(du, nm, i)
+                }
+                i = i + 1
+            }
+        }
+        di = di + 1
+    }
+    return out + "]"
 }
 
 // ==================== definition ====================

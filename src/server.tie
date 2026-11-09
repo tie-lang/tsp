@@ -426,16 +426,9 @@ pub func ident_at(txt: string, off: i64) -> string {
 // ★ p.9.16.3：**已去除** server 侧行扫描签名回退（那是重复索引的第二份实现）；
 //   索引未命中即返回 null（未索引的文档本就没有可靠签名可给）。
 func hover_result(uri: string, txt: string, line: i64, character: i64) -> string {
-    var off = pos_to_offset(txt, line, character)
-    var nm = ident_at(txt, off)
-    if len(nm) == 0 {
-        return "null"
-    }
-    var sig = ""
-    var si = an.find_sym_named(uri, nm)
-    if si >= 0 {
-        sig = an.sym_sig(uri, si)
-    }
+    // 签名查找：短名精确 → 限定名回退（util.helper），跨文档。
+    // 与 definition 同策略，避免「跳转能找到、hover 却空白」。
+    var sig = tsp_nav.symbol_sig(uri, txt, line, character)
     if len(sig) > 0 {
         var contents = "[{\"language\":\"tie\",\"value\":" + proto.json_str(sig) + "}]"
         return "{\"contents\":" + contents + "}"
@@ -523,7 +516,7 @@ func main() -> i64 {
         if method == "initialize" {
             // 服务器能力声明（p.6.9.6-6.9.11：补全/定义/引用/签名/大纲/语义令牌/折叠/重命名/高亮/修复/格式化）
             var legend = "[\"namespace\",\"type\",\"class\",\"enum\",\"interface\",\"struct\",\"typeParameter\",\"parameter\",\"variable\",\"property\",\"enumMember\",\"event\",\"function\",\"method\",\"macro\",\"keyword\",\"modifier\",\"comment\",\"string\",\"number\",\"regexp\",\"operator\",\"decorator\"]"
-            var caps = "{\"textDocumentSync\":1,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"definitionProvider\":true,\"referencesProvider\":true,\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"renameProvider\":true,\"documentHighlightProvider\":true,\"codeActionProvider\":true,\"documentFormattingProvider\":true,\"foldingRangeProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":" + legend + ",\"tokenModifiers\":[]},\"full\":true}}"
+            var caps = "{\"textDocumentSync\":1,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"definitionProvider\":true,\"referencesProvider\":true,\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"renameProvider\":true,\"documentHighlightProvider\":true,\"codeActionProvider\":true,\"documentFormattingProvider\":true,\"foldingRangeProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":" + legend + ",\"tokenModifiers\":[]},\"full\":true}}"
             var res = "{\"capabilities\":" + caps + ",\"serverInfo\":{\"name\":\"tsp\",\"version\":\"0.3.0\"}}"
             proto.write_frame(make_response(resp_id, res))
             jsonrpc_ready = true
@@ -655,6 +648,13 @@ func main() -> i64 {
             an.touch(uri)
             var dsr = tsp_sig.doc_symbols(uri)
             proto.write_frame(make_response(resp_id, dsr))
+        }
+
+        // 工作区符号搜索（Ctrl+T）：跨已索引文档按 query 前缀过滤
+        else if method == "workspace/symbol" {
+            var q = json_field(body, "query")
+            var wsr = tsp_nav.workspace_symbols(q)
+            proto.write_frame(make_response(resp_id, wsr))
         }
 
         // 语义令牌（p.6.9.9）

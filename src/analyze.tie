@@ -986,6 +986,39 @@ pub func find_sym_named(uri: string, name: string) -> i64 {
     return -1
 }
 
+// 字节级后缀判定（str_byte O(1)；不逐码点）。
+func ends_with(s: string, suf: string) -> bool {
+    var sl = len(s)
+    var fl = len(suf)
+    if sl < fl {
+        return false
+    }
+    var i: i64 = 0
+    while i < fl {
+        if str_byte(s, sl - fl + i) != str_byte(suf, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 按后缀查符号（首个匹配；-1 = 未找到）。
+// 用于短名 → 限定名解析：光标在声明处只取到末段（helper），
+// 索引里存的是限定名（util.helper），按 "." + 短名 后缀匹配。
+pub func find_sym_suffix(uri: string, suffix: string) -> i64 {
+    var n = sym_count(uri)
+    var i: i64 = 0
+    while i < n {
+        var nm = sym_name(uri, i)
+        if len(nm) > len(suffix) && ends_with(nm, suffix) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
 // 已索引文档枚举（跨文件跳转/引用用）。
 pub func doc_count() -> i64 {
     return len(g_iuris)

@@ -38,8 +38,18 @@ pub func tiec_exe() -> string {
     if str_len(p) > 0 {
         return p
     }
-    if file_exists("../tiec/compiler/tiec.exe") {
-        return "../tiec/compiler/tiec.exe"
+    // 相对 CWD 的常见布局（tsp 仓与 tiec/tie 仓并列时）；首个存在者胜出。
+    // 注意：这些路径依赖 CWD，VS Code 等场景由扩展经 TSP_TIEC 显式指定。
+    var cands = table_new_string()
+    table_push(cands, "../tiec/compiler/tiec.exe")
+    table_push(cands, "../tie/_local_only/bin/tiec.exe")
+    table_push(cands, "../tiec/tiec.exe")
+    var i: i64 = 0
+    while i < len(cands) {
+        if file_exists(cands[i]) {
+            return cands[i]
+        }
+        i = i + 1
     }
     return "tiec"
 }
