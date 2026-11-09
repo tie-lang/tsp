@@ -255,7 +255,12 @@ func emit_name(node: i64, ref tl: table<i64>, ref tc: table<i64>, ref tlens: tab
     if c0 < 0 {
         c0 = 0
     }
-    tok_push(tl, tc, tlens, tt, l0, c0, l, refine_tt(nm, t))
+    var tt2 = t
+    if t == TT_VARIABLE {
+        // 使用点：按最近的局部声明定种类（参数/局部变量），保证与声明处同色
+        tt2 = scope_lookup(nm, TT_VARIABLE)
+    }
+    tok_push(tl, tc, tlens, tt, l0, c0, l, refine_tt(nm, tt2))
 }
 
 // 名字 → 语义 token 类型：对「变量」类做实体识别。
@@ -291,6 +296,55 @@ func refine_tt(name: string, fallback: i64) -> i64 {
             return fallback
         }
         i = i + 1
+    }
+    return fallback
+}
+
+// ==================== 局部作用域栈 ====================
+// 「使用处跟着声明分类」用：参数在声明处是 parameter、使用处却是 variable，
+// 于是声明显色而使用不显色。这里在遍历时登记局部声明（参数/局部变量），
+// 遇到使用点按最近声明定种类，内层遮蔽外层。
+// 用逻辑长度 g_sc_len 截断而非真正弹出（tie 的表 pop 未实装）。
+var g_sc_names: table<string>
+var g_sc_kinds: table<i64>
+var g_sc_marks: table<i64>
+var g_sc_mark_n: i64 = 0
+var g_sc_len: i64 = 0
+
+func scope_push() {
+    table_push(g_sc_marks, g_sc_len)
+    g_sc_mark_n = g_sc_mark_n + 1
+}
+
+func scope_pop() {
+    if g_sc_mark_n > 0 {
+        g_sc_mark_n = g_sc_mark_n - 1
+        g_sc_len = g_sc_marks[g_sc_mark_n]
+    }
+}
+
+func scope_declare(name: string, kind: i64) {
+    if len(name) == 0 {
+        return
+    }
+    if len(g_sc_names) == g_sc_len {
+        table_push(g_sc_names, name)
+        table_push(g_sc_kinds, kind)
+    } else {
+        g_sc_names[g_sc_len] = name
+        g_sc_kinds[g_sc_len] = kind
+    }
+    g_sc_len = g_sc_len + 1
+}
+
+// 反向查最近声明（内层遮蔽外层）；找不到返回 fallback。
+func scope_lookup(name: string, fallback: i64) -> i64 {
+    var i = g_sc_len - 1
+    while i >= 0 {
+        if g_sc_names[i] == name {
+            return g_sc_kinds[i]
+        }
+        i = i - 1
     }
     return fallback
 }
@@ -532,6 +586,13 @@ func walk_tokens(node: i64, txt: string, ref tl: table<i64>, ref tc: table<i64>,
         return
     }
     var tag = s_tags[node]
+    // 块状节点开作用域：参数/局部变量的可见范围到此为止
+    var scoped = tag == TOK_FN_DEF || tag == TOK_IF || tag == TOK_WHILE || tag == TOK_FOR ||
+                 tag == TOK_SWITCH || tag == TOK_TRY || tag == TOK_UNSAFE_BLOCK ||
+                 tag == TOK_STMTLIST
+    if scoped {
+        scope_push()
+    }
     if tag == TOK_VAR {
         emit_name(node, tl, tc, tlens, tt, TT_VARIABLE)
     } else if tag == TOK_CALL {
@@ -553,8 +614,16 @@ func walk_tokens(node: i64, txt: string, ref tl: table<i64>, ref tc: table<i64>,
         }
     } else if tag == TOK_VAR_DECL {
         emit_var_decl(node, txt, tl, tc, tlens, tt)
+        var dv = s_names[node]
+        if dv >= 0 {
+            scope_declare(intern.lookup(dv), TT_VARIABLE)
+        }
     } else if tag == TOK_PARAM {
         emit_param(node, txt, tl, tc, tlens, tt)
+        var pv = s_names[node]
+        if pv >= 0 {
+            scope_declare(intern.lookup(pv), TT_PARAMETER)
+        }
     } else if tag == TOK_FN_DEF {
         emit_kw(node, txt, tl, tc, tlens, tt)
         emit_after_kw(node, txt, tl, tc, tlens, tt, TT_FUNCTION)
@@ -596,6 +665,9 @@ func walk_tokens(node: i64, txt: string, ref tl: table<i64>, ref tc: table<i64>,
     while k < nc {
         walk_tokens(s_children[base + k], txt, tl, tc, tlens, tt, cl, cc)
         k = k + 1
+    }
+    if scoped {
+        scope_pop()
     }
 }
 
@@ -810,8 +882,12 @@ func build_ranges_json(sl: table<i64>, el: table<i64>) -> string {
 // 文档语义令牌：LSP SemanticTokens delta 编码 JSON。run_check 失败返回
 // {"data":[]}。uri 供 server 后续按文档缓存使用（本版每次全量重算）。
 pub func semantic_tokens(uri: string, txt: string, base_dir: string) -> string {
-    var ok = an.run_check(txt, base_dir)
-    if ok != 1 {
+    // 尽力装载 AST，但**不因语义错误而放弃着色**：文件在编辑过程中几乎总有
+    // 报错（未写完的表达式、未声明变量），若「有错就返回空」，语义 token 会整片
+    // 缺失，而 TextMate 语法只覆盖声明处 ⇒ 使用处全无高亮（用户实测现象）。
+    // 只要 AST 已装载就按 AST 出 token。
+    an.run_check(txt, base_dir)
+    if len(g_file_roots) == 0 {
         return "{\"data\":[]}"
     }
     var tl = table_new_i64()
@@ -826,8 +902,9 @@ pub func semantic_tokens(uri: string, txt: string, base_dir: string) -> string {
 // 文档折叠区间：FoldingRange JSON 数组（0 基 startLine/endLine）。
 // run_check 失败返回 []。
 pub func folding_ranges(uri: string, txt: string, base_dir: string) -> string {
-    var ok = an.run_check(txt, base_dir)
-    if ok != 1 {
+    // 同 semantic_tokens：有语义错误也照常按 AST 出折叠区间
+    an.run_check(txt, base_dir)
+    if len(g_file_roots) == 0 {
         return "[]"
     }
     var sl = table_new_i64()
