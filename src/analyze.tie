@@ -1180,9 +1180,16 @@ pub func lazy_on() -> i64 {
 
 pub func debounce_ms() -> i64 {
     if g_cfg_debounce < 0 {
-        g_cfg_debounce = cfg_num("TSP_DEBOUNCE_MS", 0)
+        // 默认 250ms：didChange 只入队不分析，停顿超过该窗口才冲刷（推诊断）。
+        // 过小会让打字期间反复 spawn tiec（进程启动 ≈90ms），补全被拖慢。
+        g_cfg_debounce = cfg_num("TSP_DEBOUNCE_MS", 250)
     }
     return g_cfg_debounce
+}
+
+// 当前时刻（毫秒；与 debounce_ms 同一时基）。
+pub func now_ms() -> i64 {
+    return lru_now()
 }
 
 pub func max_open_docs() -> i64 {

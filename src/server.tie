@@ -40,10 +40,11 @@ using tsp_proto;
 // 打开的文档：文本存储在 analyze（tsp_an.store_text/fetch_text/drop_text），
 // 跨文件引用/重命名扫描可直接枚举全部打开文档（an.doc_count/doc_uri + fetch_text）。
 var g_seq: i64 = 0          // notification/request 计数（诊断用 server 版本）
-// p.9.16.2 防抖：被合并（暂缓重析）的文档 uri 队列。窗口内连续 didChange 只记
-// 文本、不重析；收到下一条**非 didChange** 消息时统一冲刷。默认窗口 0=关 ⇒ 队列
-// 恒空、行为与改造前一致。
+// 待分析队列：didChange 只入队不分析（分析要 spawn tiec，进程启动 ≈90ms，
+// 同步做会让补全请求排队等它）。冲刷时机见消息循环顶部的 flush 策略。
 var g_dirty: table<string>
+// 最近一次 didChange 时刻（毫秒）：用于「停顿超过窗口才冲刷」的空闲兜底。
+var g_last_change: i64 = 0
 
 // ---- 文档文本存取（委托 analyze 文本存储）----
 
@@ -462,6 +463,55 @@ func dirty_remove(uri: string) {
 }
 
 // 冲刷被合并的文档：重析 + 重建索引 + 推送诊断（与 didChange 直通路径等价）。
+// 该方法是否只读符号名/签名（⇒ 永不冲刷，用现成索引应答）。
+// 这三类请求跟打字强相关，必须稳定低延迟。
+func reads_index_only(method: string) -> bool {
+    if method == "textDocument/completion" {
+        return true
+    }
+    if method == "textDocument/hover" {
+        return true
+    }
+    if method == "textDocument/signatureHelp" {
+        return true
+    }
+    return false
+}
+
+// 该方法是否需要新鲜 AST/精确位置（⇒ 处理前先冲刷待分析队列）。
+// 显式列举；其余一律 false（含 didChange/didOpen/生命周期与只读符号名的请求），
+// 用现成索引或不依赖分析即可，避免打字时同步 spawn tiec 拖慢补全。
+func needs_fresh(method: string) -> bool {
+    if method == "textDocument/definition" {
+        return true
+    }
+    if method == "textDocument/references" {
+        return true
+    }
+    if method == "textDocument/rename" {
+        return true
+    }
+    if method == "textDocument/documentHighlight" {
+        return true
+    }
+    if method == "textDocument/codeAction" {
+        return true
+    }
+    if method == "textDocument/semanticTokens/full" {
+        return true
+    }
+    if method == "textDocument/foldingRange" {
+        return true
+    }
+    if method == "workspace/symbol" {
+        return true
+    }
+    if method == "workspace/didChangeWatchedFiles" {
+        return true
+    }
+    return false
+}
+
 func flush_dirty() {
     if len(g_dirty) == 0 {
         return
@@ -498,8 +548,16 @@ func main() -> i64 {
         }
         // 提取 method / id
         var method = json_field(body, "method")
-        // p.9.16.2：非 didChange 消息到达 ⇒ 先冲刷防抖队列（保证后续请求看到最新分析与索引）。
-        if method != "textDocument/didChange" {
+        // 冲刷策略（补全延迟的关键）：
+        //   · 只读符号名/签名的方法（补全、hover、签名帮助）**永不冲刷**，直接用现成
+        //     索引应答——打字时顶层符号不变，索引够用；同步冲刷会让补全排队等 tiec
+        //     进程启动（≈90ms），这正是「打字后补全框出现慢」的来源。
+        //   · 需要新鲜 AST/精确位置的方法（语义令牌、折叠、引用、重命名、高亮、修复、
+        //     大纲、工作区符号、磁盘变更）先冲刷，保证跳转/引用位置准确。
+        //   · 其余消息：文档停顿超过 debounce 窗口才冲刷（空闲兜底，延迟推诊断）。
+        if needs_fresh(method) {
+            flush_dirty()
+        } else if !reads_index_only(method) && len(g_dirty) > 0 && an.now_ms() - g_last_change > an.debounce_ms() {
             flush_dirty()
         }
         var id = json_field(body, "id")
@@ -550,24 +608,14 @@ func main() -> i64 {
             if len(uri) > 0 {
                 set_doc(uri, txt)
                 an.touch(uri)
-                // p.9.16.2 防抖：窗口内的连续变更**合并**为一次重析（默认窗口 0=关，
-                // 即逐条重析 = 改造前行为）。文本已存，故窗口内只是诊断晚推 ≤ 窗口。
-                if an.changed_recently(uri) {
-                    if !dirty_has(uri) {
-                        table_push(g_dirty, uri)
-                    }
-                    an.mark_change(uri)
-                } else {
-                    var base2 = uri_to_dir(uri)
-                    var (diags2, ok2, fresh2) = an.analyze_ex(uri, txt, base2)
-                    if ok2 == 1 && fresh2 == 1 {
-                        an.index_doc(uri)
-                    }
-                    publish_diagnostics(uri, diags2)
-                    an.mark_change(uri)
-                    // import 变更级联：依赖本文件的其它打开文档重分析
-                    cascade_imports(uri)
+                // 打字期间只入队不分析：分析要 spawn tiec（进程启动 ≈90ms），
+                // 同步做会让补全请求排队等它。索引沿用上次结果——打字时顶层符号
+                // 不变，补全/hover/签名照常工作；冲刷时机见消息循环顶部的 flush 策略。
+                if !dirty_has(uri) {
+                    table_push(g_dirty, uri)
                 }
+                an.mark_change(uri)
+                g_last_change = an.now_ms()
             }
         } else if method == "textDocument/didClose" {
             var uri = json_field(body, "uri")
