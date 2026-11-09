@@ -304,6 +304,7 @@ pub func analyze_ex(uri: string, txt: string, base_dir: string) -> (string, i64,
     // 供符号索引与后续导航（与旧「parse+check 后索引」语义等价）。
     var out: string = "[]"
     var ok: i64 = 0
+    var ast_ok: i64 = 0
     var (wrc, resp) = tsp_wire.analyze(tsp_wire.tiec_exe(), txt, base_dir, uri, 15)
     if wrc == 0 {
         var pos: i64 = 0
@@ -321,7 +322,7 @@ pub func analyze_ex(uri: string, txt: string, base_dir: string) -> (string, i64,
                         out = diags_to_json()
                     }
                 } else if w_stage == 2 {
-                    tsp_pkt.load_ast(w_pl)
+                    ast_ok = tsp_pkt.load_ast(w_pl)
                 } else if w_stage == 3 {
                     tsp_pkt.load_sym(w_pl)
                 } else if w_stage == 1 {
@@ -333,7 +334,12 @@ pub func analyze_ex(uri: string, txt: string, base_dir: string) -> (string, i64,
             pos = fr.2
         }
     }
-    if ok == 1 {
+    // 索引重建的判据是「AST 已装载」而不是「分析成功」：
+    // 语义报错时 AST 仍然有效（tiec 会发 ast 帧），若只在 ok==1 时建索引，
+    // 使用处的实体识别（refine_tt：命名空间/结构体/枚举）就查不到符号 ⇒
+    // util.helper 的 util 会退回「变量」而不显色（实测）。
+    // index_doc 在 xref 为空时回退 collect_tops（AST 浅扫描），语义报错也可用。
+    if ast_ok == 1 {
         // 装载成功 → 索引重建（主文件顶层声明；数据在 tsp_ast 容器）
         index_doc(uri)
         g_cur_loaded_fp = fp
