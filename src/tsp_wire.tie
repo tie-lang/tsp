@@ -40,10 +40,17 @@ pub func tiec_exe() -> string {
     }
     // 相对 CWD 的常见布局（tsp 仓与 tiec/tie 仓并列时）；首个存在者胜出。
     // 注意：这些路径依赖 CWD，VS Code 等场景由扩展经 TSP_TIEC 显式指定。
+    //
+    // 顺序按「编译器新旧」排：合并后单仓（tie 仓 build/tiec.exe）在前，合并前
+    // 旧布局（tiec 仓 compiler/tiec.exe）垫底。旧布局的 tiec 角色表可能落后于
+    // 当前语言——实测旧 tiec 不认 `type tie<lib>`，报「未知角色 'lib'」，把合法
+    // 库文件判成声明错误；因此旧路径不能排在首位。
     var cands = table_new_string()
-    table_push(cands, "../tiec/compiler/tiec.exe")
+    table_push(cands, "../tie/build/tiec.exe")
+    table_push(cands, "../../tie/build/tiec.exe")
     table_push(cands, "../tie/_local_only/bin/tiec.exe")
     table_push(cands, "../tiec/tiec.exe")
+    table_push(cands, "../tiec/compiler/tiec.exe")
     var i: i64 = 0
     while i < len(cands) {
         if file_exists(cands[i]) {

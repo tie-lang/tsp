@@ -23,7 +23,29 @@ tiec src/server.tie -o target/tsp.exe
 
 - `src/server.tie` 服务主入口；`protocol.tie` LSP 协议层
 - `analyze` / `completion` / `nav` / `refactor` / `sigdoc` / `format` / `tokens` 语义能力模块
+- `role.tie` 文件角色（`type tie<...>`）识别：角色表与 tiec 的 `role_registry_init_default` 对齐
 - `lsp_smoke*.py` 冒烟脚本与 `probe_*.tie` 探针（随源码仓分发）
+
+## 文件角色 / File roles
+
+tsp 认得 tie 的全部基础角色（`logic` `tsc` `class` `type` `lib` `ir` `test` `bench`
+`data` `ui` `db` `port` `zd` `tsh` `tieir`）与修饰角色（`unsafe` `owned` `embedded`）。
+角色语义本身由 tiec 判定，tsp 不重复实现：`type tie<lib>` 文件的「不允许定义 main」、
+可承载模块命名空间等规则都经被调 tiec 生效，tsp 负责把结果映射成 LSP 诊断、
+符号与着色。
+
+被调 tiec 由环境变量 `TSP_TIEC` 指定；未设置时按 CWD 探测常见布局，且**合并后单仓**
+（`tie` 仓的 `build/tiec.exe`）优先于合并前旧布局（`tiec` 仓的 `compiler/tiec.exe`）。
+旧版 tiec 的角色表可能落后于当前语言（曾出现「不认识角色 `lib`」）；此时 tsp 会在
+编译器错误之后追加一条警告，提示把 `TSP_TIEC` 指向当前编译器。
+
+*EN: tsp knows every base role (`logic` `tsc` `class` `type` `lib` `ir` `test` `bench`
+`data` `ui` `db` `port` `zd` `tsh` `tieir`) and modifier role (`unsafe` `owned` `embedded`)
+of the tie language. Role semantics are enforced by the tiec it spawns; tsp maps the
+results to diagnostics, symbols and highlighting. The compiler is selected by
+`TSP_TIEC`; when unset, tsp probes common layouts and prefers the merged single-repo
+build (`tie/build/tiec.exe`) over the pre-merge layout (`tiec/compiler/tiec.exe`).
+If the spawned tiec predates a role, tsp appends a warning pointing at `TSP_TIEC`.*
 
 ## License
 

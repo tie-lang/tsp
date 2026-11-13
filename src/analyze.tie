@@ -22,6 +22,7 @@ import "./tsp_ast.tie"
 import "./tsp_pkt.tie"
 import "./tsp_wire.tie"
 import "./protocol.tie" as proto
+import "./role.tie" as tsp_role
 
 // （包化后无前端树 shim：数据来自 tsp_pkt 装载）
 
@@ -344,8 +345,43 @@ pub func analyze_ex(uri: string, txt: string, base_dir: string) -> (string, i64,
         index_doc(uri)
         g_cur_loaded_fp = fp
     }
+    // 角色提示：本文件声明的角色 tsp 认得、被调 tiec 却不认（旧编译器）时，
+    // 补一条可操作的警告——否则用户只能对着「未知角色」自己猜是语法错了还是
+    // 环境里的编译器太旧。不改写编译器原文，只在后面追加一条说明。
+    if ok == 0 && role_hint_append(txt) == 1 {
+        out = diags_to_json()
+    }
     diag_set(uri, fp, out, ok)
     return (out, ok, 1)
+}
+
+// 已知角色被旧 tiec 拒识时，追加一条 W 级诊断（已追加返回 1）。
+// 判据：本文件确实声明了 tsp 认得的角色，且现有诊断里出现过「未知角色」字样。
+func role_hint_append(txt: string) -> i64 {
+    var role = tsp_role.header_role(txt)
+    if str_len(role) == 0 {
+        return 0
+    }
+    var hit: bool = false
+    var i: i64 = 0
+    while i < len(g_dg_rendered) {
+        if tsp_role.r_find(g_dg_rendered[i], "未知角色") >= 0 {
+            hit = true
+        }
+        i = i + 1
+    }
+    if !hit {
+        return 0
+    }
+    table_push(g_dg_codes, "")
+    table_push(g_dg_sev, 1)
+    table_push(g_dg_line, 0)
+    table_push(g_dg_col, 0)
+    table_push(g_dg_el, 0)
+    table_push(g_dg_ec, 0)
+    table_push(g_dg_rendered, tsp_role.stale_hint(role))
+    table_push(g_dg_file_ids, 0)
+    return 1
 }
 
 // 兼容入口（忽略 fresh）；需要「本次是否重建了 sstate」的调用方请用 analyze_ex。

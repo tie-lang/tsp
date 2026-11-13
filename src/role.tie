@@ -1,0 +1,301 @@
+type tie<logic>
+// ============================================================================
+// role.tie：文件角色（`type tie<...>`）识别
+// 命名空间：tsp_role
+//
+// 职责边界：本模块只「认得角色」与「从源码头解析角色」，角色带来的语义后果
+// （lib 禁 main、模块命名空间判定、产物形态检查等）一律由被调 tiec 判定，
+// 不在此重复实现——重复实现两份角色语义必然漂移。
+//
+// 角色全集与 tiec 的 role_registry_init_default 对齐
+// （tie 仓 tools/tiec/src/driver/role_reg.tie）：
+//   · 基础：logic tsc class type lib ir test bench data ui db port zd tsh tieir
+//   · 修饰：unsafe owned embedded
+// 解析只认文件首行的 `type tie<...>`；首行不是该形态即视为「未声明角色」，
+// 与 tiec 的 scan_header 口径一致（声明错误由 tiec 报，本模块不猜）。
+// ============================================================================
+
+namespace tsp_role
+
+// 基础角色全集（空格分隔；顺序同 tiec 注册顺序，便于对照排查）
+var g_base: string = "logic tsc class type lib ir test bench data ui db port zd tsh tieir"
+// 修饰角色全集
+var g_mod: string = "unsafe owned embedded"
+
+// ==================== 字节工具 ====================
+
+func r_sub(s: string, a0: i64, b0: i64) -> string {
+    var a = a0
+    var b = b0
+    if a < 0 {
+        a = 0
+    }
+    if b > len(s) {
+        b = len(s)
+    }
+    if a >= b {
+        return ""
+    }
+    return str_sub_bytes(s, a, b)
+}
+
+func r_trim(s: string) -> string {
+    var a: i64 = 0
+    var b = len(s)
+    while a < b {
+        var c = str_byte(s, a)
+        if c == 32 || c == 9 || c == 13 {
+            a = a + 1
+        } else {
+            break
+        }
+    }
+    while b > a {
+        var c = str_byte(s, b - 1)
+        if c == 32 || c == 9 || c == 13 {
+            b = b - 1
+        } else {
+            break
+        }
+    }
+    return r_sub(s, a, b)
+}
+
+// 首个 '\n' 的字节下标；无换行时返回全串长度。
+func r_line_end(s: string) -> i64 {
+    var i: i64 = 0
+    var n = len(s)
+    while i < n {
+        if str_byte(s, i) == 10 {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+func r_index_of(s: string, ch: i64) -> i64 {
+    var i: i64 = 0
+    var n = len(s)
+    while i < n {
+        if str_byte(s, i) == ch {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 子串查找（字节口径）；未命中返回 -1。
+pub func r_find(hay: string, needle: string) -> i64 {
+    var n = len(hay)
+    var m = len(needle)
+    if m == 0 || m > n {
+        return -1
+    }
+    var i: i64 = 0
+    while i + m <= n {
+        if r_sub(hay, i, i + m) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// 空格分隔词表里是否含 nm。
+func r_tok_has(lst: string, nm: string) -> bool {
+    var n = len(lst)
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= n {
+        if i == n || str_byte(lst, i) == 32 {
+            if i > start {
+                if r_sub(lst, start, i) == nm {
+                    return true
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ==================== 角色表 ====================
+
+// 是否为已知基础角色。
+pub func is_base(nm: string) -> bool {
+    return r_tok_has(g_base, nm)
+}
+
+// 是否为已知修饰角色。
+pub func is_mod(nm: string) -> bool {
+    return r_tok_has(g_mod, nm)
+}
+
+// 基础角色的产物形态（与 tiec 注册表一致；未知角色返回空串）。
+pub func out_of(nm: string) -> string {
+    if nm == "logic" {
+        return "exe"
+    }
+    if nm == "tsc" {
+        return "exe"
+    }
+    if nm == "class" {
+        return "lib"
+    }
+    if nm == "type" {
+        return "lib"
+    }
+    if nm == "lib" {
+        return "lib"
+    }
+    if nm == "ir" {
+        return "check"
+    }
+    if nm == "data" {
+        return "pass"
+    }
+    if nm == "ui" {
+        return "pass"
+    }
+    if nm == "db" {
+        return "pass"
+    }
+    if nm == "port" {
+        return "pass"
+    }
+    if nm == "zd" {
+        return "pass"
+    }
+    if nm == "tsh" {
+        return "pass"
+    }
+    return ""
+}
+
+// 角色清单的展示文本（用于诊断文案与自检）。
+pub func describe() -> string {
+    return "基础: " + g_base + "；修饰: " + g_mod
+}
+
+// ==================== 源码头解析 ====================
+
+// `type tie<...>` 的尖括号内文本；首行不是该形态时返回空串。
+func r_header_inner(src: string) -> string {
+    var e = r_line_end(src)
+    var ln = r_trim(r_sub(src, 0, e))
+    var n = len(ln)
+    if n < 7 {
+        return ""
+    }
+    if r_sub(ln, 0, 4) != "type" {
+        return ""
+    }
+    var i: i64 = 4
+    while i < n && str_byte(ln, i) == 32 {
+        i = i + 1
+    }
+    if r_sub(ln, i, i + 3) != "tie" {
+        return ""
+    }
+    i = i + 3
+    while i < n && str_byte(ln, i) == 32 {
+        i = i + 1
+    }
+    if i >= n {
+        return ""
+    }
+    if str_byte(ln, i) != 60 {
+        return ""
+    }
+    var j = i + 1
+    while j < n && str_byte(ln, j) != 62 {
+        j = j + 1
+    }
+    if j >= n {
+        return ""
+    }
+    return r_sub(ln, i + 1, j)
+}
+
+// 文件声明的基础角色；未声明或角色未知均返回空串。
+pub func header_role(src: string) -> string {
+    var inner = r_header_inner(src)
+    if len(inner) == 0 {
+        return ""
+    }
+    var c = r_index_of(inner, 44)
+    var base = inner
+    if c >= 0 {
+        base = r_sub(inner, 0, c)
+    }
+    base = r_trim(base)
+    // 带参形态 `data(ui)`：取括号前的基础名，参数由 tiec 校验（tsp 不解释参数）。
+    var paren = r_index_of(base, 40)
+    if paren >= 0 {
+        base = r_trim(r_sub(base, 0, paren))
+    }
+    if is_base(base) {
+        return base
+    }
+    return ""
+}
+
+// 文件声明的修饰角色（`unsafe:mem` 取冒号左段）；未知修饰名被丢弃。
+pub func header_mods(src: string) -> table<string> {
+    var out = table_new_string()
+    var inner = r_header_inner(src)
+    if len(inner) == 0 {
+        return out
+    }
+    var n = len(inner)
+    var start: i64 = 0
+    var i: i64 = 0
+    var first: bool = true
+    while i <= n {
+        if i == n || str_byte(inner, i) == 44 {
+            var seg = r_trim(r_sub(inner, start, i))
+            if !first {
+                var c = r_index_of(seg, 58)
+                var nm = seg
+                if c >= 0 {
+                    nm = r_trim(r_sub(seg, 0, c))
+                }
+                if is_mod(nm) {
+                    var dup: bool = false
+                    var k: i64 = 0
+                    while k < len(out) {
+                        if out[k] == nm {
+                            dup = true
+                        }
+                        k = k + 1
+                    }
+                    if !dup {
+                        table_push(out, nm)
+                    }
+                }
+            }
+            first = false
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// 该文件是否为库角色（lib / class / type 三种都产出 lib）。
+pub func is_library(src: string) -> bool {
+    var r = header_role(src)
+    if len(r) == 0 {
+        return false
+    }
+    return out_of(r) == "lib"
+}
+
+// 诊断文案：角色已声明但被调 tiec 不认（旧编译器）时的可操作提示。
+pub func stale_hint(role: string) -> string {
+    return "语言服务所用的 tiec 不认识文件角色 '" + role + "'（多半是旧版编译器，" +
+        "其角色表尚未包含该角色）；请把环境变量 TSP_TIEC 指向当前 tie 仓构建出的 tiec。"
+}
